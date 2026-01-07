@@ -46,6 +46,10 @@ enum Commands {
         /// Check for circular dependencies (for CI usage, exits with code 1 if found)
         #[arg(long)]
         check_cycles: bool,
+
+        /// Check for version conflicts (for CI usage, exits with code 1 if found)
+        #[arg(long)]
+        check_conflicts: bool,
     },
     /// Show version information
     Version,
@@ -60,6 +64,7 @@ fn main() -> io::Result<()> {
             with_bundle_size: _,
             no_tui,
             check_cycles,
+            check_conflicts,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -102,6 +107,24 @@ fn main() -> io::Result<()> {
                 }
             }
 
+            // Handle --check-conflicts flag (for CI usage)
+            if *check_conflicts {
+                let conflicts = graph.detect_version_conflicts();
+                if conflicts.is_empty() {
+                    println!("✅ No version conflicts detected.");
+                    return Ok(());
+                } else {
+                    eprintln!("❌ Version conflicts detected!");
+                    eprintln!();
+                    for conflict in &conflicts {
+                        eprintln!("  {}", conflict.description());
+                    }
+                    eprintln!();
+                    eprintln!("Found {} version conflict(s).", conflicts.len());
+                    std::process::exit(1);
+                }
+            }
+
             // Build tree structure
             let mut tree = build_dependency_tree(&pkg.name.clone().unwrap_or_else(|| "project".to_string()),
                                              &pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
@@ -110,6 +133,10 @@ fn main() -> io::Result<()> {
             // Mark nodes that are part of cycles
             let cycle_nodes = graph.get_nodes_in_cycles();
             tree.mark_cycles(&cycle_nodes);
+
+            // Mark nodes with version conflicts
+            let conflict_packages = graph.get_packages_with_conflicts();
+            tree.mark_conflicts(&conflict_packages);
 
             if *no_tui {
                 // Print tree to stdout
@@ -279,10 +306,13 @@ fn print_tree(node: &TreeNode, depth: usize) {
     // Get cycle indicator
     let cycle_indicator = if node.is_in_cycle { "[!] " } else { "" };
 
+    // Get conflict indicator
+    let conflict_indicator = if node.has_conflict { "[~] " } else { "" };
+
     if node.version.is_empty() {
         println!("{}{}{}", indent, indicator, node.name);
     } else {
-        println!("{}{}{}{}{} @ {}", indent, indicator, cycle_indicator, type_indicator, node.name, node.version);
+        println!("{}{}{}{}{}{} @ {}", indent, indicator, cycle_indicator, conflict_indicator, type_indicator, node.name, node.version);
     }
 
     if node.expanded || depth == 0 {

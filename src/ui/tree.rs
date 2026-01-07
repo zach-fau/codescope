@@ -23,6 +23,8 @@ pub struct TreeNode {
     pub dep_type: Option<DependencyType>,
     /// Whether this node is part of a circular dependency
     pub is_in_cycle: bool,
+    /// Whether this node has a version conflict
+    pub has_conflict: bool,
 }
 
 impl TreeNode {
@@ -36,6 +38,7 @@ impl TreeNode {
             depth: 0,
             dep_type: None,
             is_in_cycle: false,
+            has_conflict: false,
         }
     }
 
@@ -50,6 +53,7 @@ impl TreeNode {
             depth,
             dep_type: None,
             is_in_cycle: false,
+            has_conflict: false,
         }
     }
 
@@ -63,6 +67,7 @@ impl TreeNode {
             depth: 0,
             dep_type: Some(dep_type),
             is_in_cycle: false,
+            has_conflict: false,
         }
     }
 
@@ -74,6 +79,17 @@ impl TreeNode {
         self.is_in_cycle = cycle_nodes.contains(&self.name);
         for child in &mut self.children {
             child.mark_cycles(cycle_nodes);
+        }
+    }
+
+    /// Mark nodes that have version conflicts based on a set of conflicting package names.
+    ///
+    /// This method recursively marks all nodes in the tree that match
+    /// names in the provided set.
+    pub fn mark_conflicts(&mut self, conflict_packages: &HashSet<String>) {
+        self.has_conflict = conflict_packages.contains(&self.name);
+        for child in &mut self.children {
+            child.mark_conflicts(conflict_packages);
         }
     }
 
@@ -114,6 +130,7 @@ impl TreeNode {
             is_last_child: is_last,
             dep_type: self.dep_type,
             is_in_cycle: self.is_in_cycle,
+            has_conflict: self.has_conflict,
         });
 
         if self.expanded {
@@ -174,6 +191,8 @@ pub struct FlattenedNode {
     pub dep_type: Option<DependencyType>,
     /// Whether this node is part of a circular dependency
     pub is_in_cycle: bool,
+    /// Whether this node has a version conflict
+    pub has_conflict: bool,
 }
 
 impl FlattenedNode {
@@ -314,6 +333,7 @@ mod tests {
             is_last_child: false,
             dep_type: None,
             is_in_cycle: false,
+            has_conflict: false,
         };
         assert_eq!(node_with_children.expansion_indicator(), "▶ ");
 
@@ -381,5 +401,46 @@ mod tests {
         assert_eq!(flattened.len(), 2);
         assert!(!flattened[0].is_in_cycle); // project
         assert!(flattened[1].is_in_cycle); // dep-a
+    }
+
+    #[test]
+    fn test_mark_conflicts() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let dep_a = TreeNode::new("lodash".to_string(), "4.17.0".to_string());
+        let dep_b = TreeNode::new("react".to_string(), "18.0.0".to_string());
+        let dep_c = TreeNode::new("typescript".to_string(), "5.0.0".to_string());
+
+        root.add_child(dep_a);
+        root.add_child(dep_b);
+        root.add_child(dep_c);
+
+        // Mark lodash as having a conflict
+        let mut conflict_packages = HashSet::new();
+        conflict_packages.insert("lodash".to_string());
+
+        root.mark_conflicts(&conflict_packages);
+
+        assert!(!root.has_conflict);
+        assert!(root.children[0].has_conflict); // lodash
+        assert!(!root.children[1].has_conflict); // react
+        assert!(!root.children[2].has_conflict); // typescript
+    }
+
+    #[test]
+    fn test_flatten_includes_conflict_info() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let dep_a = TreeNode::new("lodash".to_string(), "4.17.0".to_string());
+        root.add_child(dep_a);
+
+        let mut conflict_packages = HashSet::new();
+        conflict_packages.insert("lodash".to_string());
+
+        root.mark_conflicts(&conflict_packages);
+        root.expanded = true;
+
+        let flattened = root.flatten();
+        assert_eq!(flattened.len(), 2);
+        assert!(!flattened[0].has_conflict); // project
+        assert!(flattened[1].has_conflict); // lodash
     }
 }

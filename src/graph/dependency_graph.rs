@@ -153,6 +153,8 @@ pub struct DependencyGraph {
     graph: DiGraph<DependencyNode, DependencyEdge>,
     /// Maps package names to their node indices for O(1) lookup
     node_indices: HashMap<String, NodeIndex>,
+    /// Tracks version requirements for each package: package_name -> [(version, required_by)]
+    version_requirements: HashMap<String, Vec<VersionRequirement>>,
 }
 
 impl Default for DependencyGraph {
@@ -176,6 +178,7 @@ impl DependencyGraph {
         Self {
             graph: DiGraph::new(),
             node_indices: HashMap::new(),
+            version_requirements: HashMap::new(),
         }
     }
 
@@ -192,6 +195,7 @@ impl DependencyGraph {
         Self {
             graph: DiGraph::with_capacity(nodes, edges),
             node_indices: HashMap::with_capacity(nodes),
+            version_requirements: HashMap::with_capacity(nodes),
         }
     }
 
@@ -581,6 +585,107 @@ impl DependencyGraph {
             .collect()
     }
 
+    /// Tracks a version requirement for a package.
+    ///
+    /// Records that `required_by` package requires `package_name` at `version`.
+    /// This information is used to detect version conflicts.
+    ///
+    /// # Arguments
+    ///
+    /// * `package_name` - The dependency package name
+    /// * `version` - The version specification
+    /// * `required_by` - The package that requires this dependency
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use codescope::graph::{DependencyGraph, DependencyType};
+    ///
+    /// let mut graph = DependencyGraph::new();
+    /// graph.add_dependency("lodash", "^4.17.0", DependencyType::Production);
+    /// graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+    /// graph.track_version_requirement("lodash", "^4.16.0", "other-pkg");
+    /// ```
+    pub fn track_version_requirement(
+        &mut self,
+        package_name: &str,
+        version: &str,
+        required_by: &str,
+    ) {
+        let requirements = self
+            .version_requirements
+            .entry(package_name.to_string())
+            .or_default();
+        requirements.push(VersionRequirement::new(version, required_by));
+    }
+
+    /// Detects version conflicts in the dependency graph.
+    ///
+    /// A conflict exists when the same package is required at different
+    /// versions by different dependents.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `VersionConflict` structs containing conflict details.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use codescope::graph::{DependencyGraph, DependencyType};
+    ///
+    /// let mut graph = DependencyGraph::new();
+    /// graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+    /// graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+    /// graph.track_version_requirement("lodash", "^4.16.0", "other-pkg");
+    ///
+    /// let conflicts = graph.detect_version_conflicts();
+    /// assert_eq!(conflicts.len(), 1);
+    /// ```
+    pub fn detect_version_conflicts(&self) -> Vec<VersionConflict> {
+        let mut conflicts = Vec::new();
+
+        for (package_name, requirements) in &self.version_requirements {
+            if requirements.len() <= 1 {
+                continue;
+            }
+
+            // Check if there are different versions requested
+            let versions: HashSet<&str> = requirements.iter().map(|r| r.version.as_str()).collect();
+
+            if versions.len() > 1 {
+                conflicts.push(VersionConflict {
+                    package_name: package_name.clone(),
+                    requirements: requirements.clone(),
+                });
+            }
+        }
+
+        conflicts
+    }
+
+    /// Returns a set of package names that have version conflicts.
+    ///
+    /// This is useful for marking nodes in the UI that have conflicting versions.
+    ///
+    /// # Returns
+    ///
+    /// A `HashSet` of package names with version conflicts.
+    pub fn get_packages_with_conflicts(&self) -> HashSet<String> {
+        self.detect_version_conflicts()
+            .into_iter()
+            .map(|c| c.package_name)
+            .collect()
+    }
+
+    /// Checks if any version conflicts exist.
+    ///
+    /// # Returns
+    ///
+    /// `true` if there are any version conflicts, `false` otherwise.
+    pub fn has_version_conflicts(&self) -> bool {
+        !self.detect_version_conflicts().is_empty()
+    }
+
     /// Returns the number of nodes in the graph.
     ///
     /// # Example
@@ -707,6 +812,58 @@ impl CycleInfo {
     /// Returns true if the cycle is empty (should not happen in practice).
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+}
+
+/// Represents a version requirement from a specific package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRequirement {
+    /// The version specification (e.g., "^1.0.0", ">=2.0.0")
+    pub version: String,
+    /// The package that requires this version
+    pub required_by: String,
+}
+
+impl VersionRequirement {
+    /// Creates a new version requirement.
+    pub fn new(version: impl Into<String>, required_by: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            required_by: required_by.into(),
+        }
+    }
+}
+
+/// Information about a version conflict for a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionConflict {
+    /// The package name with conflicting versions
+    pub package_name: String,
+    /// All different version requirements for this package
+    pub requirements: Vec<VersionRequirement>,
+}
+
+impl VersionConflict {
+    /// Returns a formatted string describing the conflict.
+    ///
+    /// For example: "lodash requires: ^4.17.0 (by my-app), ^4.16.0 (by other-pkg)"
+    pub fn description(&self) -> String {
+        let reqs: Vec<String> = self
+            .requirements
+            .iter()
+            .map(|r| format!("{} (by {})", r.version, r.required_by))
+            .collect();
+        format!("{} requires: {}", self.package_name, reqs.join(", "))
+    }
+
+    /// Returns the number of conflicting requirements.
+    pub fn len(&self) -> usize {
+        self.requirements.len()
+    }
+
+    /// Returns true if there are no requirements (should not happen).
+    pub fn is_empty(&self) -> bool {
+        self.requirements.is_empty()
     }
 }
 
@@ -1087,5 +1244,102 @@ mod tests {
         assert!(cycle_nodes.contains("c"));
         assert!(cycle_nodes.contains("d"));
         assert!(cycle_nodes.contains("e"));
+    }
+
+    // Version conflict tests
+    #[test]
+    fn test_track_version_requirement() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+        graph.track_version_requirement("lodash", "^4.17.0", "other-pkg");
+
+        // Same version from different packages should not be a conflict
+        assert!(!graph.has_version_conflicts());
+    }
+
+    #[test]
+    fn test_detect_version_conflicts() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+        graph.track_version_requirement("lodash", "^4.16.0", "other-pkg");
+
+        let conflicts = graph.detect_version_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].package_name, "lodash");
+        assert_eq!(conflicts[0].requirements.len(), 2);
+    }
+
+    #[test]
+    fn test_no_version_conflicts() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+        graph.track_version_requirement("lodash", "^4.17.0", "other-pkg");
+
+        let conflicts = graph.detect_version_conflicts();
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_get_packages_with_conflicts() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+
+        graph.track_version_requirement("lodash", "^4.17.0", "my-app");
+        graph.track_version_requirement("lodash", "^4.16.0", "other-pkg");
+        graph.track_version_requirement("react", "^18.0.0", "my-app");
+        graph.track_version_requirement("react", "^18.0.0", "another-pkg");
+
+        let conflicts = graph.get_packages_with_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts.contains("lodash"));
+        assert!(!conflicts.contains("react")); // Same version, no conflict
+    }
+
+    #[test]
+    fn test_multiple_version_conflicts() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+
+        graph.track_version_requirement("lodash", "^4.17.0", "app-a");
+        graph.track_version_requirement("lodash", "^4.16.0", "app-b");
+        graph.track_version_requirement("react", "^18.0.0", "app-a");
+        graph.track_version_requirement("react", "^17.0.0", "app-b");
+
+        let conflicts = graph.detect_version_conflicts();
+        assert_eq!(conflicts.len(), 2);
+
+        let conflict_names: HashSet<String> =
+            conflicts.iter().map(|c| c.package_name.clone()).collect();
+        assert!(conflict_names.contains("lodash"));
+        assert!(conflict_names.contains("react"));
+    }
+
+    #[test]
+    fn test_version_conflict_description() {
+        let conflict = VersionConflict {
+            package_name: "lodash".to_string(),
+            requirements: vec![
+                VersionRequirement::new("^4.17.0", "my-app"),
+                VersionRequirement::new("^4.16.0", "other-pkg"),
+            ],
+        };
+        let desc = conflict.description();
+        assert!(desc.contains("lodash"));
+        assert!(desc.contains("^4.17.0"));
+        assert!(desc.contains("my-app"));
+        assert!(desc.contains("^4.16.0"));
+        assert!(desc.contains("other-pkg"));
+    }
+
+    #[test]
+    fn test_version_requirement_new() {
+        let req = VersionRequirement::new("^4.17.0", "my-app");
+        assert_eq!(req.version, "^4.17.0");
+        assert_eq!(req.required_by, "my-app");
     }
 }

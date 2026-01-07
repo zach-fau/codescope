@@ -242,18 +242,23 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
     query_chars.peek().is_none()
 }
 
-/// Get the color for a dependency type, with cycle override
+/// Get the color for a dependency type, with cycle and conflict overrides
 ///
 /// Returns the appropriate color based on the dependency category:
-/// - Cycle nodes: Red (circular dependency warning)
+/// - Cycle nodes: Red (circular dependency warning - highest priority)
+/// - Conflict nodes: Rgb(255, 165, 0) orange (version conflict warning)
 /// - Production: Green (bundled with the application)
 /// - Development: Yellow (only needed during development)
 /// - Peer: Cyan (expected to be provided by the consumer)
 /// - Optional: Gray (enhance functionality if available)
-fn get_dep_type_color(dep_type: Option<DependencyType>, is_in_cycle: bool) -> Color {
-    // Cycle nodes are always shown in red regardless of dependency type
+fn get_dep_type_color(dep_type: Option<DependencyType>, is_in_cycle: bool, has_conflict: bool) -> Color {
+    // Cycle nodes are always shown in red regardless of dependency type (highest priority)
     if is_in_cycle {
         return Color::Red;
+    }
+    // Conflict nodes shown in orange
+    if has_conflict {
+        return Color::Rgb(255, 165, 0); // Orange color
     }
     match dep_type {
         Some(DependencyType::Production) => Color::Green,
@@ -287,6 +292,17 @@ fn get_dep_type_indicator(dep_type: Option<DependencyType>) -> &'static str {
 fn get_cycle_indicator(is_in_cycle: bool) -> &'static str {
     if is_in_cycle {
         "[!] "
+    } else {
+        ""
+    }
+}
+
+/// Get the conflict indicator if the node has version conflicts
+///
+/// Returns a warning symbol for nodes with conflicts
+fn get_conflict_indicator(has_conflict: bool) -> &'static str {
+    if has_conflict {
+        "[~] "
     } else {
         ""
     }
@@ -448,9 +464,10 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.get_tree_prefix(index)
             };
             let indicator = node.expansion_indicator();
-            let dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle);
+            let dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle, node.has_conflict);
             let type_indicator = get_dep_type_indicator(node.dep_type);
             let cycle_indicator = get_cycle_indicator(node.is_in_cycle);
+            let conflict_indicator = get_conflict_indicator(node.has_conflict);
 
             // Build the name with highlighting if there's a search query
             let name_spans = if has_search {
@@ -463,6 +480,7 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(indicator, Style::default().fg(Color::Yellow)),
                 Span::styled(cycle_indicator, Style::default().fg(Color::Red)),
+                Span::styled(conflict_indicator, Style::default().fg(Color::Rgb(255, 165, 0))),
                 Span::styled(type_indicator, Style::default().fg(dep_color)),
             ];
             content_spans.extend(name_spans);
@@ -586,7 +604,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[O]", Style::default().fg(Color::Gray)),
             Span::raw(" Opt  "),
             Span::styled("[!]", Style::default().fg(Color::Red)),
-            Span::raw(" Cycle"),
+            Span::raw(" Cycle  "),
+            Span::styled("[~]", Style::default().fg(Color::Rgb(255, 165, 0))),
+            Span::raw(" Conflict"),
         ])
     };
 

@@ -19,4 +19,7 @@
 
 mod dependency_graph;
 
-pub use dependency_graph::{CycleInfo, DependencyEdge, DependencyGraph, DependencyNode, DependencyType};
+pub use dependency_graph::{
+    CycleInfo, DependencyEdge, DependencyGraph, DependencyNode, DependencyType,
+    VersionConflict, VersionRequirement,
+};
