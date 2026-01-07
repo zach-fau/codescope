@@ -50,6 +50,10 @@ pub struct DependencyNode {
     pub dep_type: DependencyType,
     /// Distance from root package (0 = direct dependency)
     pub depth: usize,
+    /// Bundle size in bytes (from webpack/bundler stats)
+    pub bundle_size: Option<u64>,
+    /// Number of modules from this package included in the bundle
+    pub module_count: Option<usize>,
 }
 
 impl DependencyNode {
@@ -80,6 +84,8 @@ impl DependencyNode {
             version: version.into(),
             dep_type,
             depth: 0,
+            bundle_size: None,
+            module_count: None,
         }
     }
 
@@ -95,7 +101,38 @@ impl DependencyNode {
             version: version.into(),
             dep_type,
             depth,
+            bundle_size: None,
+            module_count: None,
         }
+    }
+
+    /// Creates a new node with bundle size information.
+    pub fn with_bundle_size(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        dep_type: DependencyType,
+        bundle_size: u64,
+        module_count: usize,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            dep_type,
+            depth: 0,
+            bundle_size: Some(bundle_size),
+            module_count: Some(module_count),
+        }
+    }
+
+    /// Sets the bundle size for this node.
+    pub fn set_bundle_size(&mut self, size: u64, module_count: usize) {
+        self.bundle_size = Some(size);
+        self.module_count = Some(module_count);
+    }
+
+    /// Returns true if this node has bundle size information.
+    pub fn has_bundle_size(&self) -> bool {
+        self.bundle_size.is_some()
     }
 }
 
@@ -919,6 +956,107 @@ impl DependencyGraph {
 
         graph
     }
+
+    /// Applies bundle size information to nodes in the graph.
+    ///
+    /// Takes a map of package names to their bundle size and module count,
+    /// and updates the corresponding nodes in the graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `sizes` - A map from package name to (size_in_bytes, module_count)
+    ///
+    /// # Returns
+    ///
+    /// The number of nodes that were updated with size information.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use codescope::graph::{DependencyGraph, DependencyType};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut graph = DependencyGraph::new();
+    /// graph.add_dependency("react", "18.2.0", DependencyType::Production);
+    /// graph.add_dependency("lodash", "4.17.21", DependencyType::Production);
+    ///
+    /// let mut sizes = HashMap::new();
+    /// sizes.insert("react".to_string(), (10000_u64, 5_usize));
+    /// sizes.insert("lodash".to_string(), (25000_u64, 10_usize));
+    ///
+    /// let updated = graph.apply_bundle_sizes(&sizes);
+    /// assert_eq!(updated, 2);
+    /// ```
+    pub fn apply_bundle_sizes(&mut self, sizes: &HashMap<String, (u64, usize)>) -> usize {
+        let mut updated = 0;
+
+        for (name, &(size, module_count)) in sizes {
+            if let Some(&idx) = self.node_indices.get(name) {
+                if let Some(node) = self.graph.node_weight_mut(idx) {
+                    node.set_bundle_size(size, module_count);
+                    updated += 1;
+                }
+            }
+        }
+
+        updated
+    }
+
+    /// Gets a mutable reference to a dependency node by name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Package name to look up
+    ///
+    /// # Returns
+    ///
+    /// `Some(&mut DependencyNode)` if found, `None` otherwise.
+    pub fn get_node_mut(&mut self, name: &str) -> Option<&mut DependencyNode> {
+        self.node_indices
+            .get(name)
+            .and_then(|&idx| self.graph.node_weight_mut(idx))
+    }
+
+    /// Gets all nodes with bundle size information.
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to nodes that have bundle size data.
+    pub fn get_nodes_with_sizes(&self) -> Vec<&DependencyNode> {
+        self.graph
+            .node_weights()
+            .filter(|node| node.has_bundle_size())
+            .collect()
+    }
+
+    /// Gets nodes sorted by bundle size (largest first).
+    ///
+    /// Only includes nodes that have bundle size information.
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to nodes sorted by bundle size in descending order.
+    pub fn get_nodes_by_bundle_size(&self) -> Vec<&DependencyNode> {
+        let mut nodes: Vec<_> = self.get_nodes_with_sizes();
+        nodes.sort_by(|a, b| {
+            b.bundle_size
+                .unwrap_or(0)
+                .cmp(&a.bundle_size.unwrap_or(0))
+        });
+        nodes
+    }
+
+    /// Calculates the total bundle size of all dependencies.
+    ///
+    /// # Returns
+    ///
+    /// The sum of all known bundle sizes in bytes.
+    pub fn total_bundle_size(&self) -> u64 {
+        self.graph
+            .node_weights()
+            .filter_map(|node| node.bundle_size)
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -1341,5 +1479,124 @@ mod tests {
         let req = VersionRequirement::new("^4.17.0", "my-app");
         assert_eq!(req.version, "^4.17.0");
         assert_eq!(req.required_by, "my-app");
+    }
+
+    // Bundle size tests
+    #[test]
+    fn test_dependency_node_with_bundle_size() {
+        let node = DependencyNode::with_bundle_size(
+            "react",
+            "18.0.0",
+            DependencyType::Production,
+            10000,
+            5,
+        );
+        assert_eq!(node.name, "react");
+        assert_eq!(node.bundle_size, Some(10000));
+        assert_eq!(node.module_count, Some(5));
+        assert!(node.has_bundle_size());
+    }
+
+    #[test]
+    fn test_dependency_node_set_bundle_size() {
+        let mut node = DependencyNode::new("react", "18.0.0", DependencyType::Production);
+        assert!(!node.has_bundle_size());
+        assert_eq!(node.bundle_size, None);
+
+        node.set_bundle_size(5000, 3);
+        assert!(node.has_bundle_size());
+        assert_eq!(node.bundle_size, Some(5000));
+        assert_eq!(node.module_count, Some(3));
+    }
+
+    #[test]
+    fn test_apply_bundle_sizes() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.add_dependency("typescript", "5.0.0", DependencyType::Development);
+
+        let mut sizes = HashMap::new();
+        sizes.insert("react".to_string(), (10000_u64, 5_usize));
+        sizes.insert("lodash".to_string(), (25000_u64, 10_usize));
+
+        let updated = graph.apply_bundle_sizes(&sizes);
+
+        assert_eq!(updated, 2);
+        assert_eq!(graph.get_node("react").unwrap().bundle_size, Some(10000));
+        assert_eq!(graph.get_node("react").unwrap().module_count, Some(5));
+        assert_eq!(graph.get_node("lodash").unwrap().bundle_size, Some(25000));
+        assert_eq!(graph.get_node("lodash").unwrap().module_count, Some(10));
+        assert_eq!(graph.get_node("typescript").unwrap().bundle_size, None);
+    }
+
+    #[test]
+    fn test_get_node_mut() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+
+        if let Some(node) = graph.get_node_mut("react") {
+            node.set_bundle_size(5000, 3);
+        }
+
+        assert_eq!(graph.get_node("react").unwrap().bundle_size, Some(5000));
+    }
+
+    #[test]
+    fn test_get_nodes_with_sizes() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.add_dependency("typescript", "5.0.0", DependencyType::Development);
+
+        let mut sizes = HashMap::new();
+        sizes.insert("react".to_string(), (10000_u64, 5_usize));
+        graph.apply_bundle_sizes(&sizes);
+
+        let nodes_with_sizes = graph.get_nodes_with_sizes();
+        assert_eq!(nodes_with_sizes.len(), 1);
+        assert_eq!(nodes_with_sizes[0].name, "react");
+    }
+
+    #[test]
+    fn test_get_nodes_by_bundle_size() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("small", "1.0.0", DependencyType::Production);
+        graph.add_dependency("large", "1.0.0", DependencyType::Production);
+        graph.add_dependency("medium", "1.0.0", DependencyType::Production);
+        graph.add_dependency("no-size", "1.0.0", DependencyType::Production);
+
+        let mut sizes = HashMap::new();
+        sizes.insert("small".to_string(), (1000_u64, 1_usize));
+        sizes.insert("large".to_string(), (50000_u64, 20_usize));
+        sizes.insert("medium".to_string(), (10000_u64, 5_usize));
+        graph.apply_bundle_sizes(&sizes);
+
+        let sorted = graph.get_nodes_by_bundle_size();
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0].name, "large");
+        assert_eq!(sorted[1].name, "medium");
+        assert_eq!(sorted[2].name, "small");
+    }
+
+    #[test]
+    fn test_total_bundle_size() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("react", "18.0.0", DependencyType::Production);
+        graph.add_dependency("lodash", "4.17.0", DependencyType::Production);
+        graph.add_dependency("no-size", "1.0.0", DependencyType::Production);
+
+        let mut sizes = HashMap::new();
+        sizes.insert("react".to_string(), (10000_u64, 5_usize));
+        sizes.insert("lodash".to_string(), (25000_u64, 10_usize));
+        graph.apply_bundle_sizes(&sizes);
+
+        assert_eq!(graph.total_bundle_size(), 35000);
+    }
+
+    #[test]
+    fn test_total_bundle_size_empty() {
+        let graph = DependencyGraph::new();
+        assert_eq!(graph.total_bundle_size(), 0);
     }
 }
