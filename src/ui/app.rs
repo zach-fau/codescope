@@ -15,8 +15,41 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::bundle::savings::{SavingsReport, SavingsCategory};
 use crate::parser::types::DependencyType;
-use super::tree::{FlattenedNode, TreeNode};
+use super::tree::{FlattenedNode, TreeNode, format_size};
+
+/// Sort mode for the dependency tree
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Alphabetical sort by name (default, preserves tree structure)
+    #[default]
+    Alphabetical,
+    /// Sort by bundle size, largest first (flattened view)
+    SizeDescending,
+    /// Sort by bundle size, smallest first (flattened view)
+    SizeAscending,
+}
+
+impl SortMode {
+    /// Cycle to the next sort mode
+    pub fn cycle(&self) -> Self {
+        match self {
+            SortMode::Alphabetical => SortMode::SizeDescending,
+            SortMode::SizeDescending => SortMode::SizeAscending,
+            SortMode::SizeAscending => SortMode::Alphabetical,
+        }
+    }
+
+    /// Get a short display name for the sort mode
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SortMode::Alphabetical => "A-Z",
+            SortMode::SizeDescending => "Size ↓",
+            SortMode::SizeAscending => "Size ↑",
+        }
+    }
+}
 
 /// Virtual scroll state for efficient rendering of large trees
 #[derive(Debug, Default, Clone)]
@@ -104,11 +137,22 @@ pub struct App {
     pub search_query: String,
     /// Virtual scroll state for performance with large trees
     pub scroll_state: VirtualScrollState,
+    /// Current sort mode for the dependency list
+    pub sort_mode: SortMode,
+    /// Savings report (optional, set when savings analysis is enabled)
+    pub savings_report: Option<SavingsReport>,
+    /// Whether to show the savings panel
+    pub show_savings_panel: bool,
 }
 
 impl App {
     /// Create a new application with the given root tree node
     pub fn new(root: TreeNode) -> Self {
+        Self::with_sort_mode(root, SortMode::default())
+    }
+
+    /// Create a new application with the given root tree node and initial sort mode
+    pub fn with_sort_mode(root: TreeNode, sort_mode: SortMode) -> Self {
         let mut app = Self {
             tree: root,
             selected_index: 0,
@@ -120,20 +164,98 @@ impl App {
             search_active: false,
             search_query: String::new(),
             scroll_state: VirtualScrollState::new(),
+            sort_mode,
+            savings_report: None,
+            show_savings_panel: false,
         };
         app.refresh_flattened();
         app.list_state.select(Some(0));
         app
     }
 
+    /// Set the savings report for display
+    pub fn set_savings_report(&mut self, report: SavingsReport) {
+        self.savings_report = Some(report);
+    }
+
+    /// Toggle the savings panel visibility
+    pub fn toggle_savings_panel(&mut self) {
+        if self.savings_report.is_some() {
+            self.show_savings_panel = !self.show_savings_panel;
+        }
+    }
+
+    /// Check if savings data is available
+    pub fn has_savings_data(&self) -> bool {
+        self.savings_report.is_some()
+    }
+
     /// Refresh the flattened view from the tree
     pub fn refresh_flattened(&mut self) {
         self.flattened = self.tree.flatten();
+        self.apply_sort();
         self.rebuild_ancestors_last();
 
         // Ensure selected index is valid
         if !self.flattened.is_empty() && self.selected_index >= self.flattened.len() {
             self.selected_index = self.flattened.len() - 1;
+        }
+    }
+
+    /// Apply the current sort mode to the flattened view
+    ///
+    /// For size-based sorting, the view is flattened (tree structure is lost)
+    /// to allow proper comparison by bundle size. Nodes without bundle size
+    /// are placed at the end.
+    fn apply_sort(&mut self) {
+        match self.sort_mode {
+            SortMode::Alphabetical => {
+                // Alphabetical mode preserves tree structure (already sorted by tree traversal)
+                // No additional sorting needed
+            }
+            SortMode::SizeDescending => {
+                // Sort by size descending, nodes without size go last
+                self.flattened.sort_by(|a, b| {
+                    match (a.bundle_size, b.bundle_size) {
+                        (Some(size_a), Some(size_b)) => size_b.cmp(&size_a),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.name.cmp(&b.name),
+                    }
+                });
+            }
+            SortMode::SizeAscending => {
+                // Sort by size ascending, nodes without size go last
+                self.flattened.sort_by(|a, b| {
+                    match (a.bundle_size, b.bundle_size) {
+                        (Some(size_a), Some(size_b)) => size_a.cmp(&size_b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.name.cmp(&b.name),
+                    }
+                });
+            }
+        }
+    }
+
+    /// Cycle to the next sort mode and refresh the view
+    pub fn cycle_sort_mode(&mut self) {
+        self.sort_mode = self.sort_mode.cycle();
+        self.refresh_flattened();
+        // Reset selection to top when changing sort mode
+        self.selected_index = 0;
+        self.list_state.select(Some(0));
+        self.scroll_state.offset = 0;
+    }
+
+    /// Set the sort mode and refresh the view
+    pub fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode != mode {
+            self.sort_mode = mode;
+            self.refresh_flattened();
+            self.selected_index = 0;
+            self.list_state.select(Some(0));
+            self.scroll_state.offset = 0;
         }
     }
 
@@ -503,6 +625,44 @@ fn get_conflict_indicator(has_conflict: bool) -> &'static str {
     }
 }
 
+/// Size thresholds for color coding (in bytes)
+const SIZE_LARGE_THRESHOLD: u64 = 500 * 1024; // 500KB
+const SIZE_MEDIUM_THRESHOLD: u64 = 100 * 1024; // 100KB
+
+/// Get the color for a bundle size based on thresholds
+///
+/// Returns the appropriate color based on size:
+/// - Red: Large (> 500KB)
+/// - Yellow: Medium (100KB - 500KB)
+/// - Green: Small (< 100KB)
+fn get_size_color(bytes: u64) -> Color {
+    if bytes >= SIZE_LARGE_THRESHOLD {
+        Color::Red
+    } else if bytes >= SIZE_MEDIUM_THRESHOLD {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Calculate the total bundle size from all nodes in a flattened tree
+fn calculate_total_bundle_size(nodes: &[FlattenedNode]) -> u64 {
+    nodes.iter()
+        .filter_map(|n| n.bundle_size)
+        .sum()
+}
+
+/// Format the size with percentage of total bundle
+fn format_size_with_percentage(bytes: u64, total: u64) -> String {
+    let size_str = format_size(bytes);
+    if total > 0 {
+        let percentage = (bytes as f64 / total as f64) * 100.0;
+        format!("{} ({:.1}%)", size_str, percentage)
+    } else {
+        size_str
+    }
+}
+
 /// Run the TUI application
 pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
@@ -529,7 +689,10 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                     match key.code {
                         KeyCode::Char('q') => app.quit(),
                         KeyCode::Esc => {
-                            if !app.search_query.is_empty() {
+                            if app.show_savings_panel {
+                                // Close savings panel first
+                                app.show_savings_panel = false;
+                            } else if !app.search_query.is_empty() {
                                 // Clear the filter but stay in normal mode
                                 app.clear_search();
                             } else {
@@ -545,6 +708,10 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                         KeyCode::PageUp | KeyCode::Char('u') => app.page_up(),
                         KeyCode::Home | KeyCode::Char('g') => app.select_first(),
                         KeyCode::End | KeyCode::Char('G') => app.select_last(),
+                        // Sort mode toggle
+                        KeyCode::Char('s') => app.cycle_sort_mode(),
+                        // Toggle savings panel
+                        KeyCode::Char('i') => app.toggle_savings_panel(),
                         _ => {}
                     }
                 }
@@ -561,7 +728,35 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
 fn render(frame: &mut Frame, app: &mut App) {
     // Determine if search bar is visible
     let show_search = app.search_active || !app.search_query.is_empty();
+    let show_savings = app.show_savings_panel && app.savings_report.is_some();
 
+    // Calculate main layout
+    let main_chunks = if show_savings {
+        // Split horizontally: tree on left, savings panel on right
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(65), // Main content
+                Constraint::Percentage(35), // Savings panel
+            ])
+            .split(frame.area())
+    } else {
+        // Full width for main content
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(frame.area())
+    };
+
+    // Render savings panel if visible
+    if show_savings {
+        if let Some(ref report) = app.savings_report {
+            render_savings_panel(frame, report, main_chunks[1]);
+        }
+    }
+
+    // Calculate vertical layout for main content area
+    let content_area = main_chunks[0];
     let chunks = if show_search {
         Layout::default()
             .direction(Direction::Vertical)
@@ -571,7 +766,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 Constraint::Min(0),    // Tree
                 Constraint::Length(3), // Footer
             ])
-            .split(frame.area())
+            .split(content_area)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
@@ -580,7 +775,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 Constraint::Min(0),    // Tree
                 Constraint::Length(3), // Footer
             ])
-            .split(frame.area())
+            .split(content_area)
     };
 
     if show_search {
@@ -658,6 +853,9 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let total_nodes = display_nodes.len();
 
+    // Calculate total bundle size for percentage display
+    let total_bundle_size = calculate_total_bundle_size(display_nodes);
+
     // Calculate viewport height (area height minus borders)
     // Border takes 2 rows (top + bottom)
     let viewport_height = (area.height as usize).saturating_sub(2);
@@ -715,6 +913,16 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 format!(" @{}", node.version),
                 Style::default().fg(Color::DarkGray),
             ));
+
+            // Add bundle size column if available
+            if let Some(size) = node.bundle_size {
+                let size_color = get_size_color(size);
+                let size_str = format_size_with_percentage(size, total_bundle_size);
+                content_spans.push(Span::styled(
+                    format!("  [{}]", size_str),
+                    Style::default().fg(size_color),
+                ));
+            }
 
             ListItem::new(Line::from(content_spans))
         })
@@ -808,6 +1016,126 @@ fn highlight_matches(text: &str, query: &str, base_color: Color) -> Vec<Span<'st
     result
 }
 
+/// Render the savings panel
+fn render_savings_panel(frame: &mut Frame, report: &SavingsReport, area: Rect) {
+    let summary = &report.summary;
+
+    // Create the panel layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // Summary section
+            Constraint::Min(0),    // Package list
+        ])
+        .split(area);
+
+    // Render summary section
+    let savings_pct = summary.savings_percentage();
+    let savings_color = if savings_pct > 30.0 {
+        Color::Red
+    } else if savings_pct > 15.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::raw("Total: "),
+            Span::styled(
+                summary.format_total_bundle_size(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Savings: "),
+            Span::styled(
+                format!("{} ({:.1}%)", summary.format_total_savings(), savings_pct),
+                Style::default().fg(savings_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{}", summary.unused_count),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw(" unused  "),
+            Span::styled(
+                format!("{}", summary.underutilized_count),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" underutil  "),
+            Span::styled(
+                format!("{}", summary.tree_shaking_count),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw(" tree-shake"),
+        ]),
+    ];
+
+    let summary_widget = Paragraph::new(summary_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Potential Savings ")
+                .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        )
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    // Render package list
+    let sorted_savings = report.savings_by_size();
+    let items: Vec<ListItem> = sorted_savings
+        .iter()
+        .take(20) // Limit to top 20 packages
+        .map(|saving| {
+            let category_color = match saving.category {
+                SavingsCategory::Unused => Color::Red,
+                SavingsCategory::Underutilized => Color::Yellow,
+                SavingsCategory::TreeShaking => Color::Blue,
+                SavingsCategory::HasAlternative => Color::Magenta,
+            };
+
+            let category_indicator = match saving.category {
+                SavingsCategory::Unused => "[U]",
+                SavingsCategory::Underutilized => "[<]",
+                SavingsCategory::TreeShaking => "[T]",
+                SavingsCategory::HasAlternative => "[A]",
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    category_indicator,
+                    Style::default().fg(category_color),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    &saving.package_name,
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("-{}", saving.format_potential_savings()),
+                    Style::default().fg(Color::Green),
+                ),
+            ]);
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let packages_widget = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Top Savings ")
+                .title_style(Style::default().fg(Color::White)),
+        )
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(packages_widget, chunks[1]);
+}
+
 /// Render the footer with help text and legend
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = if app.search_active {
@@ -823,18 +1151,23 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Cancel"),
         ])
     } else {
-        // Normal mode help with search shortcut and page navigation
-        Line::from(vec![
+        // Normal mode help with search shortcut, sort mode, and page navigation
+        let mut spans = vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" Search  "),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(" Sort  "),
+        ];
+
+        // Add savings panel shortcut if savings data is available
+        if app.has_savings_data() {
+            spans.push(Span::styled("i", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(" Savings  "));
+        }
+
+        spans.extend(vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::raw(" Nav  "),
-            Span::styled("d/u", Style::default().fg(Color::Yellow)),
-            Span::raw(" Page  "),
-            Span::styled("g/G", Style::default().fg(Color::Yellow)),
-            Span::raw(" Top/Bot  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" Toggle  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" Quit  │  "),
             Span::styled("[P]", Style::default().fg(Color::Green)),
@@ -842,10 +1175,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[D]", Style::default().fg(Color::Yellow)),
             Span::raw(" Dev  "),
             Span::styled("[!]", Style::default().fg(Color::Red)),
-            Span::raw(" Cycle  "),
-            Span::styled("L#", Style::default().fg(Color::Rgb(100, 149, 237))),
-            Span::raw(" Depth"),
-        ])
+            Span::raw(" Cycle  │  Sort: "),
+            Span::styled(app.sort_mode.display_name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]);
+
+        Line::from(spans)
     };
 
     let footer = Paragraph::new(help_text)
@@ -1179,5 +1513,342 @@ mod tests {
         app.start_search();
         app.search_push('r');
         assert_eq!(app.current_list_len(), app.filtered.len());
+    }
+
+    // Bundle size display tests
+
+    #[test]
+    fn test_get_size_color_large() {
+        // > 500KB should be red
+        let large_size = 600 * 1024; // 600KB
+        assert_eq!(get_size_color(large_size), Color::Red);
+
+        // Exactly 500KB should be red
+        let exact_large = 500 * 1024;
+        assert_eq!(get_size_color(exact_large), Color::Red);
+    }
+
+    #[test]
+    fn test_get_size_color_medium() {
+        // 100KB - 500KB should be yellow
+        let medium_size = 250 * 1024; // 250KB
+        assert_eq!(get_size_color(medium_size), Color::Yellow);
+
+        // Exactly 100KB should be yellow
+        let exact_medium = 100 * 1024;
+        assert_eq!(get_size_color(exact_medium), Color::Yellow);
+    }
+
+    #[test]
+    fn test_get_size_color_small() {
+        // < 100KB should be green
+        let small_size = 50 * 1024; // 50KB
+        assert_eq!(get_size_color(small_size), Color::Green);
+
+        // Very small
+        let tiny_size = 1024; // 1KB
+        assert_eq!(get_size_color(tiny_size), Color::Green);
+
+        // Zero bytes
+        assert_eq!(get_size_color(0), Color::Green);
+    }
+
+    #[test]
+    fn test_calculate_total_bundle_size() {
+        let nodes = vec![
+            FlattenedNode {
+                name: "react".to_string(),
+                version: "18.0.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: Some(10000),
+                module_count: Some(5),
+            },
+            FlattenedNode {
+                name: "lodash".to_string(),
+                version: "4.17.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: Some(25000),
+                module_count: Some(10),
+            },
+            FlattenedNode {
+                name: "no-size".to_string(),
+                version: "1.0.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: None,
+                module_count: None,
+            },
+        ];
+
+        let total = calculate_total_bundle_size(&nodes);
+        assert_eq!(total, 35000);
+    }
+
+    #[test]
+    fn test_calculate_total_bundle_size_empty() {
+        let nodes: Vec<FlattenedNode> = vec![];
+        assert_eq!(calculate_total_bundle_size(&nodes), 0);
+    }
+
+    #[test]
+    fn test_format_size_with_percentage() {
+        // Test with percentage
+        let result = format_size_with_percentage(10240, 102400);
+        assert!(result.contains("10.00 KB"));
+        assert!(result.contains("10.0%"));
+
+        // Test with zero total (edge case)
+        let result = format_size_with_percentage(10240, 0);
+        assert_eq!(result, "10.00 KB");
+    }
+
+    #[test]
+    fn test_format_size_with_percentage_large() {
+        // 1MB out of 2MB = 50%
+        let result = format_size_with_percentage(1048576, 2097152);
+        assert!(result.contains("1.00 MB"));
+        assert!(result.contains("50.0%"));
+    }
+
+    #[test]
+    fn test_size_thresholds() {
+        // Verify threshold constants
+        assert_eq!(SIZE_LARGE_THRESHOLD, 500 * 1024);
+        assert_eq!(SIZE_MEDIUM_THRESHOLD, 100 * 1024);
+    }
+
+    // Sort mode tests
+
+    #[test]
+    fn test_sort_mode_cycle() {
+        // Alphabetical -> SizeDescending -> SizeAscending -> Alphabetical
+        let mode = SortMode::Alphabetical;
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::SizeDescending);
+
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::SizeAscending);
+
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_sort_mode_display_name() {
+        assert_eq!(SortMode::Alphabetical.display_name(), "A-Z");
+        assert_eq!(SortMode::SizeDescending.display_name(), "Size ↓");
+        assert_eq!(SortMode::SizeAscending.display_name(), "Size ↑");
+    }
+
+    #[test]
+    fn test_sort_mode_default() {
+        let mode = SortMode::default();
+        assert_eq!(mode, SortMode::Alphabetical);
+    }
+
+    fn create_test_app_with_sizes() -> App {
+        let mut root = TreeNode::new("my-project".to_string(), "1.0.0".to_string());
+
+        let mut dep_a = TreeNode::new("alpha".to_string(), "1.0.0".to_string());
+        dep_a.bundle_size = Some(50000); // 50KB
+
+        let mut dep_b = TreeNode::new("beta".to_string(), "2.0.0".to_string());
+        dep_b.bundle_size = Some(100000); // 100KB
+
+        let mut dep_c = TreeNode::new("gamma".to_string(), "3.0.0".to_string());
+        dep_c.bundle_size = Some(25000); // 25KB
+
+        // delta has no size
+        let dep_d = TreeNode::new("delta".to_string(), "4.0.0".to_string());
+
+        root.add_child(dep_a);
+        root.add_child(dep_b);
+        root.add_child(dep_c);
+        root.add_child(dep_d);
+        root.expanded = true;
+
+        App::new(root)
+    }
+
+    #[test]
+    fn test_app_default_sort_mode() {
+        let app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_app_with_sort_mode() {
+        let root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let app = App::with_sort_mode(root, SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+    }
+
+    #[test]
+    fn test_cycle_sort_mode() {
+        let mut app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeAscending);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_set_sort_mode() {
+        let mut app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        app.set_sort_mode(SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Setting same mode should be a no-op
+        app.set_sort_mode(SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+    }
+
+    #[test]
+    fn test_sort_by_size_descending() {
+        let mut app = create_test_app_with_sizes();
+
+        // Default is alphabetical - check initial state
+        // (root + 4 children when expanded)
+        assert_eq!(app.flattened.len(), 5);
+
+        // Cycle to size descending
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Nodes with sizes should be sorted largest first
+        // Order should be: beta (100KB) > alpha (50KB) > gamma (25KB) > delta (no size) > my-project (no size)
+
+        // First nodes should have size, last should not (or be smallest)
+        // Verify that nodes with sizes come before nodes without sizes
+        let mut found_no_size = false;
+        for node in &app.flattened {
+            if node.bundle_size.is_none() {
+                found_no_size = true;
+            } else if found_no_size {
+                panic!("Node with size found after node without size in descending sort");
+            }
+        }
+
+        // Verify descending order for nodes that have sizes
+        let sizes_only: Vec<u64> = app.flattened.iter()
+            .filter_map(|n| n.bundle_size)
+            .collect();
+        for i in 1..sizes_only.len() {
+            assert!(sizes_only[i-1] >= sizes_only[i], "Sizes should be in descending order");
+        }
+    }
+
+    #[test]
+    fn test_sort_by_size_ascending() {
+        let mut app = create_test_app_with_sizes();
+
+        // Cycle twice to get to size ascending
+        app.cycle_sort_mode(); // -> SizeDescending
+        app.cycle_sort_mode(); // -> SizeAscending
+        assert_eq!(app.sort_mode, SortMode::SizeAscending);
+
+        // Verify ascending order for nodes that have sizes
+        let sizes_only: Vec<u64> = app.flattened.iter()
+            .filter_map(|n| n.bundle_size)
+            .collect();
+        for i in 1..sizes_only.len() {
+            assert!(sizes_only[i-1] <= sizes_only[i], "Sizes should be in ascending order");
+        }
+    }
+
+    #[test]
+    fn test_sort_alphabetical_preserves_tree() {
+        let mut app = create_test_app_with_sizes();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        // In alphabetical mode, tree structure should be preserved
+        // Root should come first, then children in order they were added
+        assert_eq!(app.flattened[0].name, "my-project");
+
+        // Cycle through all modes and back to alphabetical
+        app.cycle_sort_mode(); // -> SizeDescending
+        app.cycle_sort_mode(); // -> SizeAscending
+        app.cycle_sort_mode(); // -> Alphabetical
+
+        // Tree structure should be restored
+        assert_eq!(app.flattened[0].name, "my-project");
+    }
+
+    #[test]
+    fn test_cycle_sort_mode_resets_selection() {
+        let mut app = create_test_app_with_sizes();
+
+        // Move selection
+        app.select_next();
+        app.select_next();
+        assert!(app.selected_index > 0);
+
+        // Cycle sort mode
+        app.cycle_sort_mode();
+
+        // Selection should be reset to top
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_sort_with_all_no_size() {
+        // Create app with no bundle sizes
+        let mut app = create_test_app();
+
+        // Cycle to size descending - should still work
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Should fall back to alphabetical when no sizes
+        // (nodes without size are sorted by name)
+        assert!(!app.flattened.is_empty());
+    }
+
+    #[test]
+    fn test_sort_with_mixed_sizes() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+
+        let mut dep_with_size = TreeNode::new("with-size".to_string(), "1.0.0".to_string());
+        dep_with_size.bundle_size = Some(1000);
+
+        let dep_without_size = TreeNode::new("no-size".to_string(), "1.0.0".to_string());
+
+        root.add_child(dep_with_size);
+        root.add_child(dep_without_size);
+        root.expanded = true;
+
+        let app = App::with_sort_mode(root, SortMode::SizeDescending);
+
+        // Nodes with sizes should come before nodes without
+        let first_with_size = app.flattened.iter().position(|n| n.bundle_size.is_some()).unwrap();
+        let first_without_size = app.flattened.iter().position(|n| n.bundle_size.is_none()).unwrap();
+
+        assert!(first_with_size < first_without_size,
+            "Nodes with sizes should come before nodes without in size sort");
     }
 }

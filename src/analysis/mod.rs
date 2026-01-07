@@ -1,32 +1,41 @@
-//! Analysis module for CodeScope.
+//! Source code analysis module for CodeScope.
 //!
-//! This module provides static analysis tools for JavaScript/TypeScript projects,
-//! including import analysis to detect which dependency exports are actually used.
+//! This module provides tools for analyzing JavaScript/TypeScript source code
+//! to track import usage and identify unused exports from dependencies.
 //!
 //! # Features
 //!
-//! - **Import Detection**: Parse JS/TS files to extract import statements
-//! - **Usage Tracking**: Track which symbols are imported from each package
-//! - **Utilization Analysis**: Calculate how much of a dependency is being used
+//! - Parse ES6 `import` statements (default, named, namespace imports)
+//! - Parse CommonJS `require()` calls
+//! - Track which exports from each dependency are actually used
+//! - Calculate utilization percentage per dependency
+//! - Flag low-utilization dependencies
 //!
 //! # Example
 //!
 //! ```ignore
-//! use codescope::analysis::{ImportAnalyzer, ImportInfo};
 //! use std::path::Path;
+//! use codescope::analysis::{ImportAnalyzer, analyze_project_imports};
 //!
+//! // Analyze a single file
 //! let analyzer = ImportAnalyzer::new();
-//! let imports = analyzer.analyze_file(Path::new("src/app.ts")).unwrap();
+//! let imports = analyzer.analyze_file(Path::new("src/index.js"))?;
 //!
-//! for import in &imports {
-//!     println!("{}: {:?}", import.package_name, import.imported_symbols);
+//! for import in imports {
+//!     println!("{}: {:?}", import.source, import.specifiers);
+//! }
+//!
+//! // Analyze entire project
+//! let usage = analyze_project_imports(Path::new("./src"))?;
+//! for (package, info) in usage.iter() {
+//!     println!("{}: {:.1}% utilized", package, info.utilization_percentage());
 //! }
 //! ```
 
 pub mod exports;
 
-// Re-export commonly used types for convenience
+// Re-export main types for convenience
 pub use exports::{
-    AnalysisError, AnalysisResult, FileType, ImportAnalyzer, ImportInfo, ImportStyle, ImportUsage,
-    ProjectImports,
+    analyze_file, analyze_project_imports, Import, ImportAnalyzer, ImportKind, ImportSpecifier,
+    PackageUsage, ProjectImports,
 };

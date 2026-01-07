@@ -9,9 +9,10 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
+use codescope::bundle::savings::{SavingsCalculator, SavingsReport};
 use codescope::graph::{self, DependencyGraph};
 use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
-use codescope::ui::{run_app, App, TreeNode};
+use codescope::ui::{run_app, App, TreeNode, format_size, SortMode};
 
 #[derive(Parser)]
 #[command(name = "codescope")]
@@ -46,6 +47,20 @@ enum Commands {
         /// Check for version conflicts (for CI usage, exits with code 1 if found)
         #[arg(long)]
         check_conflicts: bool,
+
+        /// Sort dependencies by bundle size (largest first) instead of alphabetically
+        #[arg(long)]
+        sort_by_size: bool,
+
+        /// Generate a bundle size savings report (for CI usage)
+        /// Shows potential savings from removing unused/underutilized dependencies
+        #[arg(long)]
+        savings_report: bool,
+
+        /// Set a minimum savings threshold in KB for CI checks
+        /// Exit with code 1 if potential savings exceed this threshold
+        #[arg(long, value_name = "KB")]
+        savings_threshold: Option<u64>,
     },
     /// Show version information
     Version,
@@ -61,6 +76,9 @@ fn main() -> io::Result<()> {
             no_tui,
             check_cycles,
             check_conflicts,
+            sort_by_size,
+            savings_report,
+            savings_threshold,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -121,6 +139,34 @@ fn main() -> io::Result<()> {
                 }
             }
 
+            // Handle --savings-report flag (for CI usage)
+            if *savings_report {
+                let report = generate_savings_report(&deps);
+                print!("{}", report.format_report());
+
+                // Check threshold if specified
+                if let Some(threshold_kb) = savings_threshold {
+                    let threshold_bytes = threshold_kb * 1024;
+                    if report.summary.total_potential_savings > threshold_bytes {
+                        eprintln!();
+                        eprintln!(
+                            "❌ Potential savings ({}) exceed threshold ({} KB)!",
+                            report.summary.format_total_savings(),
+                            threshold_kb
+                        );
+                        std::process::exit(1);
+                    } else {
+                        println!();
+                        println!(
+                            "✅ Potential savings ({}) are within threshold ({} KB).",
+                            report.summary.format_total_savings(),
+                            threshold_kb
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
             // Build tree structure
             let mut tree = build_dependency_tree(&pkg.name.clone().unwrap_or_else(|| "project".to_string()),
                                              &pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
@@ -136,7 +182,8 @@ fn main() -> io::Result<()> {
 
             if *no_tui {
                 // Print tree to stdout
-                print_tree(&tree, 0);
+                let total_bundle_size = calculate_tree_total_bundle_size(&tree);
+                print_tree(&tree, 0, total_bundle_size);
                 return Ok(());
             }
 
@@ -147,8 +194,13 @@ fn main() -> io::Result<()> {
             let backend = CrosstermBackend::new(stdout);
             let mut terminal = Terminal::new(backend)?;
 
-            // Create app and run
-            let mut app = App::new(tree);
+            // Create app and run with appropriate sort mode
+            let initial_sort_mode = if *sort_by_size {
+                SortMode::SizeDescending
+            } else {
+                SortMode::Alphabetical
+            };
+            let mut app = App::with_sort_mode(tree, initial_sort_mode);
             let result = run_app(&mut terminal, &mut app);
 
             // Restore terminal
@@ -280,7 +332,7 @@ fn build_dependency_graph(deps: &[parser::Dependency]) -> DependencyGraph {
 }
 
 /// Print tree to stdout (for --no-tui mode)
-fn print_tree(node: &TreeNode, depth: usize) {
+fn print_tree(node: &TreeNode, depth: usize, total_bundle_size: u64) {
     let indent = "  ".repeat(depth);
     let indicator = if node.children.is_empty() {
         "  "
@@ -305,15 +357,100 @@ fn print_tree(node: &TreeNode, depth: usize) {
     // Get conflict indicator
     let conflict_indicator = if node.has_conflict { "[~] " } else { "" };
 
+    // Get bundle size indicator
+    let size_indicator = if let Some(size) = node.bundle_size {
+        if total_bundle_size > 0 {
+            let percentage = (size as f64 / total_bundle_size as f64) * 100.0;
+            format!(" [{} ({:.1}%)]", format_size(size), percentage)
+        } else {
+            format!(" [{}]", format_size(size))
+        }
+    } else {
+        String::new()
+    };
+
     if node.version.is_empty() {
         println!("{}{}{}", indent, indicator, node.name);
     } else {
-        println!("{}{}{}{}{}{} @ {}", indent, indicator, cycle_indicator, conflict_indicator, type_indicator, node.name, node.version);
+        println!("{}{}{}{}{}{} @ {}{}", indent, indicator, cycle_indicator, conflict_indicator, type_indicator, node.name, node.version, size_indicator);
     }
 
     if node.expanded || depth == 0 {
         for child in &node.children {
-            print_tree(child, depth + 1);
+            print_tree(child, depth + 1, total_bundle_size);
         }
     }
+}
+
+/// Calculate total bundle size from a tree
+fn calculate_tree_total_bundle_size(node: &TreeNode) -> u64 {
+    let mut total = node.bundle_size.unwrap_or(0);
+    for child in &node.children {
+        total += calculate_tree_total_bundle_size(child);
+    }
+    total
+}
+
+/// Generate a savings report from parsed dependencies
+///
+/// This creates a mock bundle analysis from the dependency list since we don't
+/// have actual webpack stats. For real bundle size data, use --with-bundle-size
+/// with a stats.json file.
+fn generate_savings_report(deps: &[parser::Dependency]) -> SavingsReport {
+    use std::collections::HashMap;
+    use codescope::bundle::webpack::{BundleAnalysis, PackageBundleSize};
+    use codescope::analysis::exports::ProjectImports;
+
+    // Create a mock bundle analysis from dependencies
+    // In a real implementation, this would come from webpack stats
+    let mut analysis = BundleAnalysis::default();
+
+    // Use estimated sizes based on common package sizes
+    // This is a heuristic - real sizes would come from webpack stats
+    let estimated_sizes: HashMap<&str, u64> = [
+        ("react", 45 * 1024),
+        ("react-dom", 120 * 1024),
+        ("lodash", 70 * 1024),
+        ("moment", 290 * 1024),
+        ("axios", 15 * 1024),
+        ("express", 200 * 1024),
+        ("webpack", 100 * 1024),
+        ("typescript", 10 * 1024), // TypeScript is dev-only, minimal bundle impact
+        ("@types/", 0), // Type definitions have no runtime cost
+        ("eslint", 0), // Dev dependency
+        ("jest", 0), // Dev dependency
+        ("prettier", 0), // Dev dependency
+    ].into_iter().collect();
+
+    let default_size = 25 * 1024; // 25KB default estimate
+
+    for dep in deps {
+        // Skip dev dependencies for bundle size (they don't affect runtime bundle)
+        if matches!(dep.dep_type, DependencyType::Development) {
+            continue;
+        }
+
+        // Estimate size based on known packages or use default
+        let size = estimated_sizes
+            .iter()
+            .find(|(name, _)| dep.name.starts_with(*name))
+            .map(|(_, size)| *size)
+            .unwrap_or(default_size);
+
+        if size > 0 {
+            let mut pkg = PackageBundleSize::new(&dep.name);
+            pkg.add_module(format!("{}/index.js", dep.name), size);
+            analysis.package_sizes.insert(dep.name.clone(), pkg);
+            analysis.total_module_size += size;
+        }
+    }
+
+    // Create empty project imports (no source analysis in this mode)
+    // In a real implementation, we'd analyze the source code
+    let project_imports = ProjectImports::new();
+    let export_counts = HashMap::new();
+
+    // Calculate savings
+    let calculator = SavingsCalculator::new();
+    calculator.calculate(&analysis, &project_imports, &export_counts)
 }

@@ -1,1047 +1,1008 @@
-//! Export and import analysis using tree-sitter.
+//! Import analysis using tree-sitter for JavaScript/TypeScript.
 //!
-//! This module provides functionality to parse JavaScript and TypeScript files
-//! to extract import statements and track which symbols are imported from each package.
+//! This module parses source files to extract import statements and track
+//! which exports from each dependency are actually used.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
 use thiserror::Error;
+use tree_sitter::{Language, Parser, Tree};
+use walkdir::WalkDir;
 
 /// Errors that can occur during import analysis.
-#[derive(Debug, Error)]
+#[derive(Error, Debug)]
 pub enum AnalysisError {
-    /// Failed to read the source file.
     #[error("Failed to read file: {0}")]
-    IoError(#[from] std::io::Error),
+    FileRead(#[from] std::io::Error),
 
-    /// Failed to parse the source file.
-    #[error("Failed to parse file: {0}")]
-    ParseError(String),
+    #[error("Failed to parse file: {path}")]
+    ParseError { path: String },
 
-    /// Unsupported file type.
     #[error("Unsupported file type: {0}")]
     UnsupportedFileType(String),
+
+    #[error("Tree-sitter language initialization failed")]
+    LanguageInit,
 }
 
 /// Result type for analysis operations.
 pub type AnalysisResult<T> = Result<T, AnalysisError>;
 
-/// Represents the style of import used.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ImportStyle {
-    /// Named imports: `import { foo, bar } from 'package'`
-    Named,
-    /// Default import: `import foo from 'package'`
-    Default,
-    /// Namespace import: `import * as foo from 'package'`
-    Namespace,
-    /// Side-effect import: `import 'package'`
-    SideEffect,
-    /// CommonJS require: `const foo = require('package')`
-    CommonJs,
-    /// Dynamic import: `import('package')`
-    Dynamic,
+/// The kind of import statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportKind {
+    /// ES6 import statement: `import ... from 'module'`
+    ES6,
+    /// CommonJS require: `const x = require('module')`
+    CommonJS,
+    /// Dynamic import: `import('module')`
+    DynamicImport,
 }
 
-impl std::fmt::Display for ImportStyle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ImportStyle::Named => "named",
-            ImportStyle::Default => "default",
-            ImportStyle::Namespace => "namespace",
-            ImportStyle::SideEffect => "side-effect",
-            ImportStyle::CommonJs => "commonjs",
-            ImportStyle::Dynamic => "dynamic",
-        };
-        write!(f, "{}", s)
+/// An individual import specifier within an import statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSpecifier {
+    /// Default import: `import foo from 'module'`
+    Default(String),
+    /// Named import: `import { foo } from 'module'` or `import { foo as bar } from 'module'`
+    Named {
+        imported: String,
+        local: String,
+    },
+    /// Namespace import: `import * as foo from 'module'`
+    Namespace(String),
+    /// Side-effect import: `import 'module'` (no specifiers)
+    SideEffect,
+    /// Entire module (CommonJS style): `const mod = require('module')`
+    Entire(String),
+}
+
+impl ImportSpecifier {
+    /// Returns the exported name that is being imported (the original name in the source module).
+    pub fn exported_name(&self) -> Option<&str> {
+        match self {
+            ImportSpecifier::Default(_) => Some("default"),
+            ImportSpecifier::Named { imported, .. } => Some(imported),
+            ImportSpecifier::Namespace(_) => None, // Uses all exports
+            ImportSpecifier::SideEffect => None,
+            ImportSpecifier::Entire(_) => None, // Uses entire module
+        }
+    }
+
+    /// Returns the local name (the name used in the importing file).
+    pub fn local_name(&self) -> Option<&str> {
+        match self {
+            ImportSpecifier::Default(name) => Some(name),
+            ImportSpecifier::Named { local, .. } => Some(local),
+            ImportSpecifier::Namespace(name) => Some(name),
+            ImportSpecifier::SideEffect => None,
+            ImportSpecifier::Entire(name) => Some(name),
+        }
     }
 }
 
-/// Information about a single import statement.
+/// Represents a single import statement in a source file.
 #[derive(Debug, Clone)]
-pub struct ImportInfo {
-    /// The package name being imported from (e.g., "react", "lodash").
-    pub package_name: String,
-
-    /// The symbols imported from this package.
-    /// Empty for namespace, side-effect, or default imports.
-    pub imported_symbols: Vec<String>,
-
-    /// The style of import used.
-    pub import_style: ImportStyle,
-
-    /// The local alias if different from the original name.
-    /// For `import { foo as bar }`, this would be Some("bar").
-    pub alias: Option<String>,
-
-    /// The line number where this import appears.
+pub struct Import {
+    /// The source module (e.g., "react", "./utils", "@scope/package")
+    pub source: String,
+    /// The specifiers being imported
+    pub specifiers: Vec<ImportSpecifier>,
+    /// The kind of import
+    pub kind: ImportKind,
+    /// Line number in the source file (1-indexed)
     pub line: usize,
 }
 
-impl ImportInfo {
-    /// Creates a new ImportInfo instance.
-    pub fn new(package_name: String, import_style: ImportStyle) -> Self {
-        Self {
-            package_name,
-            imported_symbols: Vec::new(),
-            import_style,
-            alias: None,
-            line: 0,
+impl Import {
+    /// Returns true if this import is from an npm package (not a relative/absolute path).
+    pub fn is_package_import(&self) -> bool {
+        !self.source.starts_with('.') && !self.source.starts_with('/')
+    }
+
+    /// Returns the package name for npm imports.
+    /// Handles scoped packages like @scope/package.
+    pub fn package_name(&self) -> Option<&str> {
+        if !self.is_package_import() {
+            return None;
+        }
+
+        // Handle scoped packages: @scope/package/subpath -> @scope/package
+        if self.source.starts_with('@') {
+            let parts: Vec<&str> = self.source.splitn(3, '/').collect();
+            if parts.len() >= 2 {
+                // Return @scope/package
+                let end = self.source.find('/').unwrap() + 1 + parts[1].len();
+                return Some(&self.source[..end.min(self.source.len())]);
+            }
+        }
+
+        // Regular package: package/subpath -> package
+        if let Some(idx) = self.source.find('/') {
+            Some(&self.source[..idx])
+        } else {
+            Some(&self.source)
         }
     }
 
-    /// Returns true if this is a local/relative import (starts with . or /).
-    pub fn is_local(&self) -> bool {
-        self.package_name.starts_with('.')
-            || self.package_name.starts_with('/')
-            || self.package_name.starts_with("@/")
+    /// Returns true if this is a namespace import (uses all exports).
+    pub fn is_namespace_import(&self) -> bool {
+        self.specifiers
+            .iter()
+            .any(|s| matches!(s, ImportSpecifier::Namespace(_)))
     }
 
-    /// Returns true if this is an external package import.
-    pub fn is_external(&self) -> bool {
-        !self.is_local()
+    /// Returns true if this is a side-effect only import.
+    pub fn is_side_effect_only(&self) -> bool {
+        self.specifiers.len() == 1 && matches!(self.specifiers[0], ImportSpecifier::SideEffect)
     }
 }
 
-/// Aggregated import usage for a single package across the project.
-#[derive(Debug, Clone)]
-pub struct ImportUsage {
-    /// The package name.
-    pub package_name: String,
-
-    /// All unique symbols imported from this package.
-    pub imported_symbols: HashSet<String>,
-
-    /// Number of files that import this package.
-    pub import_count: usize,
-
-    /// The import styles used for this package.
-    pub import_styles: HashSet<ImportStyle>,
-
-    /// Whether the package is ever imported with namespace import.
-    pub has_namespace_import: bool,
-
-    /// Whether the package is ever imported with side-effect import.
-    pub has_side_effect_import: bool,
-}
-
-impl ImportUsage {
-    /// Creates a new ImportUsage instance.
-    pub fn new(package_name: String) -> Self {
-        Self {
-            package_name,
-            imported_symbols: HashSet::new(),
-            import_count: 0,
-            import_styles: HashSet::new(),
-            has_namespace_import: false,
-            has_side_effect_import: false,
-        }
-    }
-
-    /// Merges another import into this usage tracker.
-    pub fn merge(&mut self, import: &ImportInfo) {
-        self.import_count += 1;
-        self.import_styles.insert(import.import_style.clone());
-
-        for symbol in &import.imported_symbols {
-            self.imported_symbols.insert(symbol.clone());
-        }
-
-        if import.import_style == ImportStyle::Namespace {
-            self.has_namespace_import = true;
-        }
-
-        if import.import_style == ImportStyle::SideEffect {
-            self.has_side_effect_import = true;
-        }
-    }
-
-    /// Returns true if we can determine utilization (not namespace/side-effect).
-    pub fn can_calculate_utilization(&self) -> bool {
-        !self.has_namespace_import && !self.has_side_effect_import
-    }
-
-    /// Returns the number of unique symbols imported.
-    pub fn symbol_count(&self) -> usize {
-        self.imported_symbols.len()
-    }
-}
-
-/// Aggregated imports for an entire project.
+/// Tracks usage information for a single package.
 #[derive(Debug, Clone, Default)]
+pub struct PackageUsage {
+    /// Named exports that are imported from this package.
+    pub named_imports: HashSet<String>,
+    /// Whether the default export is used.
+    pub uses_default: bool,
+    /// Whether a namespace import is used (import * as x).
+    pub uses_namespace: bool,
+    /// Whether there are side-effect imports.
+    pub has_side_effects: bool,
+    /// Files that import this package.
+    pub importing_files: HashSet<String>,
+}
+
+impl PackageUsage {
+    /// Returns the number of distinct exports being used.
+    /// Namespace imports count as "all exports" (represented as -1 in percentage calc).
+    pub fn export_count(&self) -> usize {
+        let mut count = self.named_imports.len();
+        if self.uses_default {
+            count += 1;
+        }
+        count
+    }
+
+    /// Calculate utilization percentage given the total number of exports.
+    /// Returns 100% if namespace import is used (uses everything).
+    /// Returns None if no exports are used (side-effect only).
+    pub fn utilization_percentage(&self, total_exports: usize) -> Option<f64> {
+        if self.uses_namespace {
+            return Some(100.0);
+        }
+        if total_exports == 0 {
+            return None;
+        }
+        let used = self.export_count();
+        Some((used as f64 / total_exports as f64) * 100.0)
+    }
+
+    /// Returns true if this package might be underutilized.
+    /// A package is potentially underutilized if:
+    /// - It doesn't use namespace import
+    /// - It uses less than 20% of exports (if we know total)
+    pub fn is_potentially_underutilized(&self, total_exports: usize) -> bool {
+        if self.uses_namespace || total_exports == 0 {
+            return false;
+        }
+        let used = self.export_count();
+        (used as f64 / total_exports as f64) < 0.2
+    }
+}
+
+/// Collection of all imports found in a project.
+#[derive(Debug, Default)]
 pub struct ProjectImports {
-    /// Map of package name to its import usage.
-    pub packages: HashMap<String, ImportUsage>,
-
-    /// Total number of files analyzed.
-    pub files_analyzed: usize,
-
-    /// Files that failed to parse.
-    pub parse_errors: Vec<String>,
+    /// All imports by file path.
+    pub imports_by_file: HashMap<String, Vec<Import>>,
+    /// Package usage statistics.
+    pub package_usage: HashMap<String, PackageUsage>,
 }
 
 impl ProjectImports {
-    /// Creates a new ProjectImports instance.
+    /// Create a new empty ProjectImports.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds imports from a single file to the project imports.
-    pub fn add_file_imports(&mut self, imports: Vec<ImportInfo>) {
-        self.files_analyzed += 1;
+    /// Add imports from a file.
+    pub fn add_file_imports(&mut self, file_path: &str, imports: Vec<Import>) {
+        for import in &imports {
+            if let Some(pkg_name) = import.package_name() {
+                let usage = self.package_usage.entry(pkg_name.to_string()).or_default();
+                usage.importing_files.insert(file_path.to_string());
 
-        for import in imports {
-            // Skip local imports
-            if import.is_local() {
-                continue;
+                for spec in &import.specifiers {
+                    match spec {
+                        ImportSpecifier::Default(_) => {
+                            usage.uses_default = true;
+                        }
+                        ImportSpecifier::Named { imported, .. } => {
+                            usage.named_imports.insert(imported.clone());
+                        }
+                        ImportSpecifier::Namespace(_) => {
+                            usage.uses_namespace = true;
+                        }
+                        ImportSpecifier::SideEffect => {
+                            usage.has_side_effects = true;
+                        }
+                        ImportSpecifier::Entire(_) => {
+                            usage.uses_namespace = true; // CommonJS require uses whole module
+                        }
+                    }
+                }
             }
-
-            let usage = self
-                .packages
-                .entry(import.package_name.clone())
-                .or_insert_with(|| ImportUsage::new(import.package_name.clone()));
-
-            usage.merge(&import);
         }
+
+        self.imports_by_file.insert(file_path.to_string(), imports);
     }
 
-    /// Records a parse error for a file.
-    pub fn add_parse_error(&mut self, file_path: String) {
-        self.parse_errors.push(file_path);
+    /// Get list of packages sorted by number of importing files (descending).
+    pub fn packages_by_usage(&self) -> Vec<(&String, &PackageUsage)> {
+        let mut packages: Vec<_> = self.package_usage.iter().collect();
+        packages.sort_by(|a, b| b.1.importing_files.len().cmp(&a.1.importing_files.len()));
+        packages
     }
 
-    /// Returns packages that have zero named imports (potential unused dependencies).
-    pub fn packages_with_zero_imports(&self) -> Vec<&ImportUsage> {
-        self.packages
-            .values()
-            .filter(|usage| {
-                usage.imported_symbols.is_empty()
-                    && !usage.has_namespace_import
-                    && !usage.has_side_effect_import
+    /// Get packages that might be underutilized given export counts.
+    pub fn underutilized_packages(
+        &self,
+        export_counts: &HashMap<String, usize>,
+    ) -> Vec<(&String, &PackageUsage, f64)> {
+        self.package_usage
+            .iter()
+            .filter_map(|(name, usage)| {
+                let total = export_counts.get(name).copied().unwrap_or(0);
+                if total > 0 && usage.is_potentially_underutilized(total) {
+                    let percentage = usage.utilization_percentage(total).unwrap_or(0.0);
+                    Some((name, usage, percentage))
+                } else {
+                    None
+                }
             })
             .collect()
     }
-
-    /// Returns all external package names that are imported.
-    pub fn imported_packages(&self) -> Vec<&str> {
-        self.packages.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Returns the usage info for a specific package.
-    pub fn get_package(&self, name: &str) -> Option<&ImportUsage> {
-        self.packages.get(name)
-    }
 }
 
-/// Analyzer for extracting import information from JavaScript/TypeScript files.
-pub struct ImportAnalyzer {
-    js_parser: tree_sitter::Parser,
-    ts_parser: tree_sitter::Parser,
-    tsx_parser: tree_sitter::Parser,
+/// Language type for file analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLanguage {
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Jsx,
 }
 
-impl ImportAnalyzer {
-    /// Creates a new ImportAnalyzer with JavaScript and TypeScript parsers.
-    pub fn new() -> Self {
-        let mut js_parser = tree_sitter::Parser::new();
-        js_parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .expect("Failed to load JavaScript grammar");
-
-        let mut ts_parser = tree_sitter::Parser::new();
-        ts_parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("Failed to load TypeScript grammar");
-
-        let mut tsx_parser = tree_sitter::Parser::new();
-        tsx_parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-            .expect("Failed to load TSX grammar");
-
-        Self {
-            js_parser,
-            ts_parser,
-            tsx_parser,
-        }
-    }
-
-    /// Determines the file type based on extension.
-    fn get_file_type(path: &Path) -> Option<FileType> {
-        let ext = path.extension()?.to_str()?;
-        match ext {
-            "js" | "mjs" | "cjs" | "jsx" => Some(FileType::JavaScript),
-            "ts" | "mts" | "cts" => Some(FileType::TypeScript),
-            "tsx" => Some(FileType::Tsx),
+impl SourceLanguage {
+    /// Determine language from file extension.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_lowercase().as_str() {
+            "js" | "mjs" | "cjs" => Some(SourceLanguage::JavaScript),
+            "jsx" => Some(SourceLanguage::Jsx),
+            "ts" | "mts" | "cts" => Some(SourceLanguage::TypeScript),
+            "tsx" => Some(SourceLanguage::Tsx),
             _ => None,
         }
     }
 
-    /// Analyzes a single file and returns all import information.
-    pub fn analyze_file(&mut self, path: &Path) -> AnalysisResult<Vec<ImportInfo>> {
-        let file_type = Self::get_file_type(path)
-            .ok_or_else(|| AnalysisError::UnsupportedFileType(path.display().to_string()))?;
+    /// Get tree-sitter language for this source language.
+    #[allow(dead_code)]
+    pub fn tree_sitter_language(&self) -> Language {
+        match self {
+            SourceLanguage::JavaScript | SourceLanguage::Jsx => {
+                tree_sitter_javascript::LANGUAGE.into()
+            }
+            SourceLanguage::TypeScript | SourceLanguage::Tsx => {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            }
+        }
+    }
+}
 
-        let source = fs::read_to_string(path)?;
-        self.analyze_source(&source, file_type)
+/// Analyzer for extracting imports from JavaScript/TypeScript source files.
+pub struct ImportAnalyzer {
+    js_parser: Parser,
+    ts_parser: Parser,
+}
+
+impl ImportAnalyzer {
+    /// Create a new ImportAnalyzer.
+    pub fn new() -> AnalysisResult<Self> {
+        let mut js_parser = Parser::new();
+        js_parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .map_err(|_| AnalysisError::LanguageInit)?;
+
+        let mut ts_parser = Parser::new();
+        ts_parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .map_err(|_| AnalysisError::LanguageInit)?;
+
+        Ok(Self {
+            js_parser,
+            ts_parser,
+        })
     }
 
-    /// Analyzes source code and returns all import information.
+    /// Analyze a single file and extract all imports.
+    pub fn analyze_file(&mut self, path: &Path) -> AnalysisResult<Vec<Import>> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let language = SourceLanguage::from_extension(ext)
+            .ok_or_else(|| AnalysisError::UnsupportedFileType(ext.to_string()))?;
+
+        let content = fs::read_to_string(path)?;
+        self.analyze_source(&content, language, path)
+    }
+
+    /// Analyze source code directly.
     pub fn analyze_source(
         &mut self,
         source: &str,
-        file_type: FileType,
-    ) -> AnalysisResult<Vec<ImportInfo>> {
-        let parser = match file_type {
-            FileType::JavaScript => &mut self.js_parser,
-            FileType::TypeScript => &mut self.ts_parser,
-            FileType::Tsx => &mut self.tsx_parser,
+        language: SourceLanguage,
+        path: &Path,
+    ) -> AnalysisResult<Vec<Import>> {
+        let parser = match language {
+            SourceLanguage::JavaScript | SourceLanguage::Jsx => &mut self.js_parser,
+            SourceLanguage::TypeScript | SourceLanguage::Tsx => &mut self.ts_parser,
         };
 
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| AnalysisError::ParseError("Failed to parse source".to_string()))?;
+        let tree = parser.parse(source, None).ok_or_else(|| AnalysisError::ParseError {
+            path: path.display().to_string(),
+        })?;
 
-        let mut imports = Vec::new();
-        let mut cursor = tree.walk();
-
-        self.extract_imports(&mut cursor, source.as_bytes(), &mut imports);
-
-        Ok(imports)
+        Ok(self.extract_imports(&tree, source))
     }
 
-    /// Recursively extracts imports from the AST.
-    fn extract_imports(
+    /// Extract imports from a parsed tree.
+    fn extract_imports(&self, tree: &Tree, source: &str) -> Vec<Import> {
+        let mut imports = Vec::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+
+        self.visit_node(&mut cursor, source, &mut imports);
+
+        imports
+    }
+
+    /// Recursively visit nodes to find imports.
+    fn visit_node(
         &self,
         cursor: &mut tree_sitter::TreeCursor,
-        source: &[u8],
-        imports: &mut Vec<ImportInfo>,
+        source: &str,
+        imports: &mut Vec<Import>,
     ) {
-        loop {
-            let node = cursor.node();
+        let node = cursor.node();
 
-            match node.kind() {
-                "import_statement" => {
-                    if let Some(import) = self.parse_import_statement(node, source) {
-                        imports.push(import);
-                    }
-                }
-                "call_expression" => {
-                    // Check for dynamic import() only (not require - that's handled in variable_declaration)
-                    // Also handle standalone require() calls that aren't assigned to variables
-                    if let Some(import) = self.parse_call_expression(node, source) {
-                        // Only add if it's a dynamic import OR if it's a standalone require (not inside a variable declaration)
-                        let parent_kind = node.parent().map(|p| p.kind());
-                        let is_in_variable_declarator = parent_kind == Some("variable_declarator");
-
-                        if import.import_style == ImportStyle::Dynamic || !is_in_variable_declarator {
-                            // For require that IS in a variable declarator, skip it (handled by variable_declaration case)
-                            if import.import_style == ImportStyle::CommonJs && is_in_variable_declarator {
-                                // Skip - will be handled by parse_variable_require
-                            } else {
-                                imports.push(import);
-                            }
-                        }
-                    }
-                }
-                "lexical_declaration" | "variable_declaration" => {
-                    // Check for `const x = require('...')`
-                    if let Some(import) = self.parse_variable_require(node, source) {
-                        imports.push(import);
-                    }
-                }
-                _ => {}
-            }
-
-            // Recurse into children
-            if cursor.goto_first_child() {
-                self.extract_imports(cursor, source, imports);
-                cursor.goto_parent();
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    /// Parses an ES6 import statement.
-    fn parse_import_statement(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> Option<ImportInfo> {
-        let mut import_clause = None;
-        let mut source_node = None;
-
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let child = cursor.node();
-            match child.kind() {
-                "import_clause" => import_clause = Some(child),
-                "string" | "string_fragment" => source_node = Some(child),
-                _ => {}
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // Get the module source (package name)
-        let source_node = source_node?;
-        let package_name = self.get_string_content(source_node, source)?;
-
-        let line = node.start_position().row + 1;
-
-        // Side-effect import: `import 'package'`
-        if import_clause.is_none() {
-            return Some(ImportInfo {
-                package_name,
-                imported_symbols: Vec::new(),
-                import_style: ImportStyle::SideEffect,
-                alias: None,
-                line,
-            });
-        }
-
-        let import_clause = import_clause?;
-        let (symbols, style, alias) = self.parse_import_clause(import_clause, source);
-
-        Some(ImportInfo {
-            package_name,
-            imported_symbols: symbols,
-            import_style: style,
-            alias,
-            line,
-        })
-    }
-
-    /// Parses the import clause to extract symbols and style.
-    fn parse_import_clause(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> (Vec<String>, ImportStyle, Option<String>) {
-        let mut symbols = Vec::new();
-        let mut style = ImportStyle::Default;
-        let mut alias = None;
-
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let child = cursor.node();
-            match child.kind() {
-                "identifier" => {
-                    // Default import: `import foo from 'package'`
-                    if let Ok(name) = child.utf8_text(source) {
-                        alias = Some(name.to_string());
-                        style = ImportStyle::Default;
-                    }
-                }
-                "namespace_import" => {
-                    // Namespace import: `import * as foo from 'package'`
-                    style = ImportStyle::Namespace;
-                    if let Some(name) = self.get_namespace_alias(child, source) {
-                        alias = Some(name);
-                    }
-                }
-                "named_imports" => {
-                    // Named imports: `import { foo, bar } from 'package'`
-                    style = ImportStyle::Named;
-                    symbols = self.parse_named_imports(child, source);
-                }
-                _ => {}
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        (symbols, style, alias)
-    }
-
-    /// Parses named imports to extract symbol names.
-    fn parse_named_imports(&self, node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
-        let mut symbols = Vec::new();
-        let mut cursor = node.walk();
-
-        if !cursor.goto_first_child() {
-            return symbols;
-        }
-
-        loop {
-            let child = cursor.node();
-            if child.kind() == "import_specifier" {
-                if let Some(name) = self.get_import_specifier_name(child, source) {
-                    symbols.push(name);
+        match node.kind() {
+            "import_statement" => {
+                if let Some(import) = self.parse_es6_import(&node, source) {
+                    imports.push(import);
                 }
             }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        symbols
-    }
-
-    /// Gets the original name from an import specifier.
-    fn get_import_specifier_name(&self, node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        // The first identifier is the original name
-        // In `import { foo as bar }`, we want "foo"
-        loop {
-            let child = cursor.node();
-            if child.kind() == "identifier" {
-                return child.utf8_text(source).ok().map(|s| s.to_string());
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Gets the alias from a namespace import.
-    fn get_namespace_alias(&self, node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        loop {
-            let child = cursor.node();
-            if child.kind() == "identifier" {
-                return child.utf8_text(source).ok().map(|s| s.to_string());
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Parses a call expression for require() or dynamic import().
-    fn parse_call_expression(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> Option<ImportInfo> {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        let function_node = cursor.node();
-        let function_name = function_node.utf8_text(source).ok()?;
-
-        // Check for dynamic import()
-        if function_name == "import" {
-            cursor.goto_next_sibling(); // Move to arguments
-            let args = cursor.node();
-            if args.kind() == "arguments" {
-                let package_name = self.get_first_string_arg(args, source)?;
-                return Some(ImportInfo {
-                    package_name,
-                    imported_symbols: Vec::new(),
-                    import_style: ImportStyle::Dynamic,
-                    alias: None,
-                    line: node.start_position().row + 1,
-                });
-            }
-        }
-
-        // Check for require()
-        if function_name == "require" {
-            cursor.goto_next_sibling(); // Move to arguments
-            let args = cursor.node();
-            if args.kind() == "arguments" {
-                let package_name = self.get_first_string_arg(args, source)?;
-                return Some(ImportInfo {
-                    package_name,
-                    imported_symbols: Vec::new(),
-                    import_style: ImportStyle::CommonJs,
-                    alias: None,
-                    line: node.start_position().row + 1,
-                });
-            }
-        }
-
-        None
-    }
-
-    /// Parses variable declarations that use require().
-    fn parse_variable_require(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> Option<ImportInfo> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        loop {
-            let child = cursor.node();
-            if child.kind() == "variable_declarator" {
-                return self.parse_variable_declarator_require(child, source);
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Parses a variable declarator for require() patterns.
-    fn parse_variable_declarator_require(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> Option<ImportInfo> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        let mut pattern_node = None;
-        let mut value_node = None;
-
-        loop {
-            let child = cursor.node();
-            match child.kind() {
-                "identifier" | "object_pattern" | "array_pattern" => {
-                    if pattern_node.is_none() {
-                        pattern_node = Some(child);
-                    }
+            "call_expression" => {
+                // Check for require() or dynamic import()
+                if let Some(import) = self.parse_require_or_dynamic_import(&node, source) {
+                    imports.push(import);
                 }
-                "call_expression" => {
-                    value_node = Some(child);
-                }
-                _ => {}
             }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+            _ => {}
         }
 
-        let value_node = value_node?;
-
-        // Check if the call expression is require()
-        let mut cursor = value_node.walk();
-        cursor.goto_first_child();
-        let function_node = cursor.node();
-
-        if function_node.utf8_text(source).ok()? != "require" {
-            return None;
-        }
-
-        cursor.goto_next_sibling();
-        let args = cursor.node();
-        if args.kind() != "arguments" {
-            return None;
-        }
-
-        let package_name = self.get_first_string_arg(args, source)?;
-        let line = node.start_position().row + 1;
-
-        // Check if destructured: `const { foo, bar } = require('package')`
-        let (symbols, alias) = match pattern_node {
-            Some(pattern) if pattern.kind() == "object_pattern" => {
-                let symbols = self.parse_object_pattern(pattern, source);
-                (symbols, None)
-            }
-            Some(pattern) if pattern.kind() == "identifier" => {
-                let alias = pattern.utf8_text(source).ok().map(|s| s.to_string());
-                (Vec::new(), alias)
-            }
-            _ => (Vec::new(), None),
-        };
-
-        let style = if symbols.is_empty() {
-            ImportStyle::CommonJs
-        } else {
-            ImportStyle::Named
-        };
-
-        Some(ImportInfo {
-            package_name,
-            imported_symbols: symbols,
-            import_style: style,
-            alias,
-            line,
-        })
-    }
-
-    /// Parses an object pattern to extract destructured names.
-    fn parse_object_pattern(&self, node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut cursor = node.walk();
-
-        if !cursor.goto_first_child() {
-            return names;
-        }
-
-        loop {
-            let child = cursor.node();
-            match child.kind() {
-                "shorthand_property_identifier_pattern" | "shorthand_property_identifier" => {
-                    if let Ok(name) = child.utf8_text(source) {
-                        names.push(name.to_string());
-                    }
-                }
-                "pair_pattern" => {
-                    // Handle `{ foo: bar }` pattern - we want "foo"
-                    if let Some(name) = self.get_pair_pattern_key(child, source) {
-                        names.push(name);
-                    }
-                }
-                _ => {}
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        names
-    }
-
-    /// Gets the key from a pair pattern.
-    fn get_pair_pattern_key(&self, node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        loop {
-            let child = cursor.node();
-            if child.kind() == "property_identifier" || child.kind() == "identifier" {
-                return child.utf8_text(source).ok().map(|s| s.to_string());
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Gets the first string argument from an arguments node.
-    fn get_first_string_arg(&self, node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-        let mut cursor = node.walk();
-        if !cursor.goto_first_child() {
-            return None;
-        }
-
-        loop {
-            let child = cursor.node();
-            if child.kind() == "string" {
-                return self.get_string_content(child, source);
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Extracts the content from a string node (removing quotes).
-    fn get_string_content(&self, node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-        let mut cursor = node.walk();
-
-        // Try to find string_fragment child
+        // Visit children
         if cursor.goto_first_child() {
             loop {
-                let child = cursor.node();
-                if child.kind() == "string_fragment" {
-                    return child.utf8_text(source).ok().map(|s| s.to_string());
-                }
+                self.visit_node(cursor, source, imports);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
             }
+            cursor.goto_parent();
+        }
+    }
+
+    /// Parse an ES6 import statement.
+    fn parse_es6_import(&self, node: &tree_sitter::Node, source: &str) -> Option<Import> {
+        let mut source_module = String::new();
+        let mut specifiers = Vec::new();
+        let line = node.start_position().row + 1;
+
+        let mut cursor = node.walk();
+
+        // Find the source (string after 'from')
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "string" => {
+                    source_module = self.extract_string_value(&child, source)?;
+                }
+                "import_clause" => {
+                    self.parse_import_clause(&child, source, &mut specifiers);
+                }
+                _ => {}
+            }
         }
 
-        // Fallback: extract from the string node directly (remove quotes)
-        let text = node.utf8_text(source).ok()?;
-        if (text.starts_with('"') && text.ends_with('"'))
-            || (text.starts_with('\'') && text.ends_with('\''))
-            || (text.starts_with('`') && text.ends_with('`'))
-        {
-            Some(text[1..text.len() - 1].to_string())
-        } else {
-            Some(text.to_string())
+        // Side-effect import if no specifiers
+        if specifiers.is_empty() && !source_module.is_empty() {
+            specifiers.push(ImportSpecifier::SideEffect);
         }
+
+        if source_module.is_empty() {
+            return None;
+        }
+
+        Some(Import {
+            source: source_module,
+            specifiers,
+            kind: ImportKind::ES6,
+            line,
+        })
+    }
+
+    /// Parse the import clause (everything between 'import' and 'from').
+    fn parse_import_clause(
+        &self,
+        node: &tree_sitter::Node,
+        source: &str,
+        specifiers: &mut Vec<ImportSpecifier>,
+    ) {
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" => {
+                    // Default import: import foo from 'module'
+                    if let Some(name) = self.node_text(&child, source) {
+                        specifiers.push(ImportSpecifier::Default(name.to_string()));
+                    }
+                }
+                "namespace_import" => {
+                    // Namespace import: import * as foo from 'module'
+                    if let Some(name) = self.find_namespace_name(&child, source) {
+                        specifiers.push(ImportSpecifier::Namespace(name));
+                    }
+                }
+                "named_imports" => {
+                    // Named imports: import { foo, bar as baz } from 'module'
+                    self.parse_named_imports(&child, source, specifiers);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Find the local name in a namespace import (import * as NAME).
+    fn find_namespace_name(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                return self.node_text(&child, source).map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+    /// Parse named imports: { foo, bar as baz, default as qux }
+    fn parse_named_imports(
+        &self,
+        node: &tree_sitter::Node,
+        source: &str,
+        specifiers: &mut Vec<ImportSpecifier>,
+    ) {
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "import_specifier" {
+                if let Some(spec) = self.parse_import_specifier(&child, source) {
+                    specifiers.push(spec);
+                }
+            }
+        }
+    }
+
+    /// Parse a single import specifier: foo or foo as bar
+    fn parse_import_specifier(
+        &self,
+        node: &tree_sitter::Node,
+        source: &str,
+    ) -> Option<ImportSpecifier> {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Check for "name as alias" pattern
+        let mut imported = None;
+        let mut local = None;
+
+        for child in children.iter() {
+            if child.kind() == "identifier" {
+                let name = self.node_text(child, source)?;
+                if imported.is_none() {
+                    imported = Some(name.to_string());
+                } else {
+                    local = Some(name.to_string());
+                }
+            }
+        }
+
+        let imported = imported?;
+        let local = local.unwrap_or_else(|| imported.clone());
+
+        Some(ImportSpecifier::Named { imported, local })
+    }
+
+    /// Parse require() calls or dynamic import().
+    fn parse_require_or_dynamic_import(
+        &self,
+        node: &tree_sitter::Node,
+        source: &str,
+    ) -> Option<Import> {
+        let line = node.start_position().row + 1;
+
+        // Get the function being called
+        let func_node = node.child_by_field_name("function")?;
+        let func_name = self.node_text(&func_node, source)?;
+
+        let (kind, is_require) = match func_name {
+            "require" => (ImportKind::CommonJS, true),
+            "import" => (ImportKind::DynamicImport, false),
+            _ => return None,
+        };
+
+        // Get arguments
+        let args_node = node.child_by_field_name("arguments")?;
+        let mut args_cursor = args_node.walk();
+
+        for child in args_node.children(&mut args_cursor) {
+            if child.kind() == "string" {
+                let source_module = self.extract_string_value(&child, source)?;
+
+                // For CommonJS require, try to find the variable name
+                let specifiers = if is_require {
+                    self.find_require_variable_name(node, source)
+                        .map(|name| vec![ImportSpecifier::Entire(name)])
+                        .unwrap_or_else(|| vec![ImportSpecifier::SideEffect])
+                } else {
+                    vec![ImportSpecifier::SideEffect]
+                };
+
+                return Some(Import {
+                    source: source_module,
+                    specifiers,
+                    kind,
+                    line,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Find the variable name in `const x = require('...')`.
+    fn find_require_variable_name(
+        &self,
+        call_node: &tree_sitter::Node,
+        source: &str,
+    ) -> Option<String> {
+        // Go up to find variable_declarator or lexical_declaration
+        let parent = call_node.parent()?;
+
+        match parent.kind() {
+            "variable_declarator" => {
+                // const x = require('...')
+                let name_node = parent.child_by_field_name("name")?;
+                match name_node.kind() {
+                    "identifier" => self.node_text(&name_node, source).map(|s| s.to_string()),
+                    "object_pattern" | "array_pattern" => {
+                        // Destructuring: const { x, y } = require('...')
+                        // For now, treat as namespace import
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the text content of a node.
+    fn node_text<'a>(&self, node: &tree_sitter::Node, source: &'a str) -> Option<&'a str> {
+        let start = node.start_byte();
+        let end = node.end_byte();
+        source.get(start..end)
+    }
+
+    /// Extract string value (removes quotes).
+    fn extract_string_value(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
+        let text = self.node_text(node, source)?;
+        // Remove quotes (single, double, or backticks)
+        let trimmed = text
+            .trim_start_matches(['"', '\'', '`'])
+            .trim_end_matches(['"', '\'', '`']);
+        Some(trimmed.to_string())
     }
 }
 
 impl Default for ImportAnalyzer {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("Failed to initialize ImportAnalyzer")
     }
 }
 
-/// The type of JavaScript/TypeScript file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileType {
-    /// JavaScript (.js, .mjs, .cjs, .jsx)
-    JavaScript,
-    /// TypeScript (.ts, .mts, .cts)
-    TypeScript,
-    /// TSX (.tsx)
-    Tsx,
+/// Analyze a single file and return its imports.
+pub fn analyze_file(path: &Path) -> AnalysisResult<Vec<Import>> {
+    let mut analyzer = ImportAnalyzer::new()?;
+    analyzer.analyze_file(path)
+}
+
+/// Analyze all JavaScript/TypeScript files in a directory.
+pub fn analyze_project_imports(root: &Path) -> AnalysisResult<ProjectImports> {
+    let mut analyzer = ImportAnalyzer::new()?;
+    let mut project = ProjectImports::new();
+
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_dir(e))
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+
+        // Skip directories
+        if path.is_dir() {
+            continue;
+        }
+
+        // Check if it's a supported file type
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if SourceLanguage::from_extension(ext).is_none() {
+            continue;
+        }
+
+        match analyzer.analyze_file(path) {
+            Ok(imports) => {
+                let file_path = path.display().to_string();
+                project.add_file_imports(&file_path, imports);
+            }
+            Err(e) => {
+                // Log error but continue with other files
+                eprintln!("Warning: Failed to analyze {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    Ok(project)
+}
+
+/// Check if a directory should be ignored during traversal.
+fn is_ignored_dir(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+
+    let name = entry.file_name().to_string_lossy();
+    matches!(
+        name.as_ref(),
+        "node_modules" | ".git" | "dist" | "build" | ".next" | "coverage" | ".turbo"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn analyze_js(source: &str) -> Vec<ImportInfo> {
-        let mut analyzer = ImportAnalyzer::new();
+    fn parse_source(source: &str) -> Vec<Import> {
+        let mut analyzer = ImportAnalyzer::new().unwrap();
         analyzer
-            .analyze_source(source, FileType::JavaScript)
+            .analyze_source(source, SourceLanguage::JavaScript, Path::new("test.js"))
             .unwrap()
     }
 
-    fn analyze_ts(source: &str) -> Vec<ImportInfo> {
-        let mut analyzer = ImportAnalyzer::new();
+    fn parse_ts_source(source: &str) -> Vec<Import> {
+        let mut analyzer = ImportAnalyzer::new().unwrap();
         analyzer
-            .analyze_source(source, FileType::TypeScript)
+            .analyze_source(source, SourceLanguage::TypeScript, Path::new("test.ts"))
             .unwrap()
+    }
+
+    // ===== ES6 Import Tests =====
+
+    #[test]
+    fn test_default_import() {
+        let source = r#"import React from 'react';"#;
+        let imports = parse_source(source);
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "react");
+        assert_eq!(imports[0].kind, ImportKind::ES6);
+        assert_eq!(imports[0].specifiers.len(), 1);
+        assert!(matches!(
+            &imports[0].specifiers[0],
+            ImportSpecifier::Default(name) if name == "React"
+        ));
     }
 
     #[test]
     fn test_named_imports() {
         let source = r#"import { useState, useEffect } from 'react';"#;
-        let imports = analyze_js(source);
+        let imports = parse_source(source);
 
         assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "react");
-        assert_eq!(imports[0].import_style, ImportStyle::Named);
-        assert_eq!(imports[0].imported_symbols, vec!["useState", "useEffect"]);
+        assert_eq!(imports[0].source, "react");
+        assert_eq!(imports[0].specifiers.len(), 2);
+
+        let names: Vec<_> = imports[0]
+            .specifiers
+            .iter()
+            .filter_map(|s| s.exported_name())
+            .collect();
+        assert!(names.contains(&"useState"));
+        assert!(names.contains(&"useEffect"));
     }
 
     #[test]
-    fn test_default_import() {
-        let source = r#"import lodash from 'lodash';"#;
-        let imports = analyze_js(source);
+    fn test_named_import_with_alias() {
+        let source = r#"import { useState as state } from 'react';"#;
+        let imports = parse_source(source);
 
         assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "lodash");
-        assert_eq!(imports[0].import_style, ImportStyle::Default);
-        assert_eq!(imports[0].alias, Some("lodash".to_string()));
+        assert_eq!(imports[0].specifiers.len(), 1);
+        assert!(matches!(
+            &imports[0].specifiers[0],
+            ImportSpecifier::Named { imported, local }
+                if imported == "useState" && local == "state"
+        ));
     }
 
     #[test]
     fn test_namespace_import() {
-        let source = r#"import * as utils from './utils';"#;
-        let imports = analyze_js(source);
+        let source = r#"import * as React from 'react';"#;
+        let imports = parse_source(source);
 
         assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "./utils");
-        assert_eq!(imports[0].import_style, ImportStyle::Namespace);
-        assert_eq!(imports[0].alias, Some("utils".to_string()));
-    }
-
-    #[test]
-    fn test_side_effect_import() {
-        let source = r#"import 'polyfill';"#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "polyfill");
-        assert_eq!(imports[0].import_style, ImportStyle::SideEffect);
-    }
-
-    #[test]
-    fn test_commonjs_require() {
-        let source = r#"const fs = require('fs');"#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "fs");
-        assert_eq!(imports[0].import_style, ImportStyle::CommonJs);
-        assert_eq!(imports[0].alias, Some("fs".to_string()));
-    }
-
-    #[test]
-    fn test_destructured_require() {
-        let source = r#"const { readFile, writeFile } = require('fs');"#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "fs");
-        assert_eq!(imports[0].import_style, ImportStyle::Named);
-        assert!(imports[0].imported_symbols.contains(&"readFile".to_string()));
-        assert!(imports[0].imported_symbols.contains(&"writeFile".to_string()));
+        assert_eq!(imports[0].source, "react");
+        assert!(matches!(
+            &imports[0].specifiers[0],
+            ImportSpecifier::Namespace(name) if name == "React"
+        ));
+        assert!(imports[0].is_namespace_import());
     }
 
     #[test]
     fn test_mixed_imports() {
-        let source = r#"
-            import React, { useState } from 'react';
-            import * as lodash from 'lodash';
-            import 'polyfill';
-            const fs = require('fs');
-        "#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 4);
-
-        // React import (default + named combined)
-        let react_import = imports.iter().find(|i| i.package_name == "react").unwrap();
-        assert!(
-            react_import.import_style == ImportStyle::Default
-                || react_import.import_style == ImportStyle::Named
-        );
-
-        // Lodash namespace
-        let lodash_import = imports.iter().find(|i| i.package_name == "lodash").unwrap();
-        assert_eq!(lodash_import.import_style, ImportStyle::Namespace);
-
-        // Polyfill side-effect
-        let polyfill_import = imports.iter().find(|i| i.package_name == "polyfill").unwrap();
-        assert_eq!(polyfill_import.import_style, ImportStyle::SideEffect);
-
-        // fs require
-        let fs_import = imports.iter().find(|i| i.package_name == "fs").unwrap();
-        assert_eq!(fs_import.import_style, ImportStyle::CommonJs);
-    }
-
-    #[test]
-    fn test_typescript_imports() {
-        let source = r#"
-            import type { FC } from 'react';
-            import { useState } from 'react';
-        "#;
-        let imports = analyze_ts(source);
-
-        // Should capture both imports
-        assert!(imports.len() >= 1);
-        let react_imports: Vec<_> = imports.iter().filter(|i| i.package_name == "react").collect();
-        assert!(!react_imports.is_empty());
-    }
-
-    #[test]
-    fn test_scoped_package() {
-        let source = r#"import { Button } from '@mui/material';"#;
-        let imports = analyze_js(source);
+        let source = r#"import React, { useState, useEffect } from 'react';"#;
+        let imports = parse_source(source);
 
         assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "@mui/material");
-        assert_eq!(imports[0].imported_symbols, vec!["Button"]);
+        assert_eq!(imports[0].specifiers.len(), 3);
+
+        let has_default = imports[0]
+            .specifiers
+            .iter()
+            .any(|s| matches!(s, ImportSpecifier::Default(_)));
+        assert!(has_default);
+
+        let named_count = imports[0]
+            .specifiers
+            .iter()
+            .filter(|s| matches!(s, ImportSpecifier::Named { .. }))
+            .count();
+        assert_eq!(named_count, 2);
     }
 
     #[test]
-    fn test_local_import_detection() {
-        let imports = analyze_js(r#"import { foo } from './local';"#);
-        assert!(imports[0].is_local());
-        assert!(!imports[0].is_external());
+    fn test_side_effect_import() {
+        let source = r#"import './styles.css';"#;
+        let imports = parse_source(source);
 
-        let imports = analyze_js(r#"import { bar } from 'external-pkg';"#);
-        assert!(!imports[0].is_local());
-        assert!(imports[0].is_external());
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "./styles.css");
+        assert!(imports[0].is_side_effect_only());
     }
+
+    // ===== CommonJS Tests =====
+
+    #[test]
+    fn test_require_simple() {
+        let source = r#"const React = require('react');"#;
+        let imports = parse_source(source);
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "react");
+        assert_eq!(imports[0].kind, ImportKind::CommonJS);
+        assert!(matches!(
+            &imports[0].specifiers[0],
+            ImportSpecifier::Entire(name) if name == "React"
+        ));
+    }
+
+    #[test]
+    fn test_require_without_assignment() {
+        let source = r#"require('./polyfills');"#;
+        let imports = parse_source(source);
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "./polyfills");
+        assert_eq!(imports[0].kind, ImportKind::CommonJS);
+        assert!(imports[0].is_side_effect_only());
+    }
+
+    // ===== Package Name Tests =====
+
+    #[test]
+    fn test_package_name_simple() {
+        let import = Import {
+            source: "react".to_string(),
+            specifiers: vec![ImportSpecifier::Default("React".to_string())],
+            kind: ImportKind::ES6,
+            line: 1,
+        };
+        assert_eq!(import.package_name(), Some("react"));
+    }
+
+    #[test]
+    fn test_package_name_with_subpath() {
+        let import = Import {
+            source: "lodash/debounce".to_string(),
+            specifiers: vec![ImportSpecifier::Default("debounce".to_string())],
+            kind: ImportKind::ES6,
+            line: 1,
+        };
+        assert_eq!(import.package_name(), Some("lodash"));
+    }
+
+    #[test]
+    fn test_package_name_scoped() {
+        let import = Import {
+            source: "@tanstack/react-query".to_string(),
+            specifiers: vec![],
+            kind: ImportKind::ES6,
+            line: 1,
+        };
+        assert_eq!(import.package_name(), Some("@tanstack/react-query"));
+    }
+
+    #[test]
+    fn test_package_name_scoped_with_subpath() {
+        let import = Import {
+            source: "@tanstack/react-query/devtools".to_string(),
+            specifiers: vec![],
+            kind: ImportKind::ES6,
+            line: 1,
+        };
+        assert_eq!(import.package_name(), Some("@tanstack/react-query"));
+    }
+
+    #[test]
+    fn test_relative_import_no_package() {
+        let import = Import {
+            source: "./utils".to_string(),
+            specifiers: vec![],
+            kind: ImportKind::ES6,
+            line: 1,
+        };
+        assert_eq!(import.package_name(), None);
+    }
+
+    // ===== TypeScript Tests =====
+
+    #[test]
+    fn test_typescript_type_import() {
+        let source = r#"import type { FC } from 'react';"#;
+        let imports = parse_ts_source(source);
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "react");
+    }
+
+    // ===== ProjectImports Tests =====
 
     #[test]
     fn test_project_imports_aggregation() {
         let mut project = ProjectImports::new();
 
-        // File 1
-        project.add_file_imports(vec![
-            ImportInfo {
-                package_name: "react".to_string(),
-                imported_symbols: vec!["useState".to_string()],
-                import_style: ImportStyle::Named,
-                alias: None,
-                line: 1,
-            },
-            ImportInfo {
-                package_name: "./local".to_string(),
-                imported_symbols: vec!["foo".to_string()],
-                import_style: ImportStyle::Named,
-                alias: None,
-                line: 2,
-            },
-        ]);
-
-        // File 2
-        project.add_file_imports(vec![ImportInfo {
-            package_name: "react".to_string(),
-            imported_symbols: vec!["useEffect".to_string()],
-            import_style: ImportStyle::Named,
-            alias: None,
+        let imports1 = vec![Import {
+            source: "react".to_string(),
+            specifiers: vec![
+                ImportSpecifier::Named {
+                    imported: "useState".to_string(),
+                    local: "useState".to_string(),
+                },
+            ],
+            kind: ImportKind::ES6,
             line: 1,
-        }]);
+        }];
 
-        assert_eq!(project.files_analyzed, 2);
-        assert_eq!(project.packages.len(), 1); // Only external packages
+        let imports2 = vec![Import {
+            source: "react".to_string(),
+            specifiers: vec![
+                ImportSpecifier::Named {
+                    imported: "useEffect".to_string(),
+                    local: "useEffect".to_string(),
+                },
+            ],
+            kind: ImportKind::ES6,
+            line: 1,
+        }];
 
-        let react_usage = project.get_package("react").unwrap();
-        assert_eq!(react_usage.import_count, 2);
-        assert!(react_usage.imported_symbols.contains("useState"));
-        assert!(react_usage.imported_symbols.contains("useEffect"));
+        project.add_file_imports("file1.js", imports1);
+        project.add_file_imports("file2.js", imports2);
+
+        let react_usage = project.package_usage.get("react").unwrap();
+        assert_eq!(react_usage.named_imports.len(), 2);
+        assert!(react_usage.named_imports.contains("useState"));
+        assert!(react_usage.named_imports.contains("useEffect"));
+        assert_eq!(react_usage.importing_files.len(), 2);
     }
 
     #[test]
-    fn test_import_usage_utilization() {
-        let mut usage = ImportUsage::new("test".to_string());
+    fn test_utilization_percentage() {
+        let mut usage = PackageUsage::default();
+        usage.named_imports.insert("foo".to_string());
+        usage.named_imports.insert("bar".to_string());
 
-        // Named imports can calculate utilization
-        usage.merge(&ImportInfo {
-            package_name: "test".to_string(),
-            imported_symbols: vec!["foo".to_string()],
-            import_style: ImportStyle::Named,
-            alias: None,
-            line: 1,
-        });
-        assert!(usage.can_calculate_utilization());
+        // 2 out of 10 exports = 20%
+        assert_eq!(usage.utilization_percentage(10), Some(20.0));
 
-        // Namespace imports cannot
-        usage.merge(&ImportInfo {
-            package_name: "test".to_string(),
-            imported_symbols: vec![],
-            import_style: ImportStyle::Namespace,
-            alias: Some("test".to_string()),
-            line: 2,
-        });
-        assert!(!usage.can_calculate_utilization());
+        // With default export: 3 out of 10 = 30%
+        usage.uses_default = true;
+        assert_eq!(usage.utilization_percentage(10), Some(30.0));
+
+        // Namespace import = 100%
+        usage.uses_namespace = true;
+        assert_eq!(usage.utilization_percentage(10), Some(100.0));
     }
 
     #[test]
-    fn test_aliased_import() {
-        let source = r#"import { useState as state } from 'react';"#;
-        let imports = analyze_js(source);
+    fn test_underutilized_detection() {
+        let mut usage = PackageUsage::default();
+        usage.named_imports.insert("foo".to_string());
+
+        // 1 out of 10 = 10% < 20% threshold
+        assert!(usage.is_potentially_underutilized(10));
+
+        // 1 out of 5 = 20% = threshold (not underutilized)
+        assert!(!usage.is_potentially_underutilized(5));
+
+        // Namespace import is never underutilized
+        usage.uses_namespace = true;
+        assert!(!usage.is_potentially_underutilized(10));
+    }
+
+    // ===== Multiple Import Statements =====
+
+    #[test]
+    fn test_multiple_imports() {
+        let source = r#"
+import React from 'react';
+import { useQuery } from '@tanstack/react-query';
+import axios from 'axios';
+import './styles.css';
+"#;
+        let imports = parse_source(source);
+
+        assert_eq!(imports.len(), 4);
+
+        let packages: Vec<_> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(packages.contains(&"react"));
+        assert!(packages.contains(&"@tanstack/react-query"));
+        assert!(packages.contains(&"axios"));
+        assert!(packages.contains(&"./styles.css"));
+    }
+
+    // ===== Dynamic Import Tests =====
+
+    #[test]
+    fn test_dynamic_import() {
+        let source = r#"const module = await import('lodash');"#;
+        let imports = parse_source(source);
 
         assert_eq!(imports.len(), 1);
-        // We capture the original name, not the alias
-        assert_eq!(imports[0].imported_symbols, vec!["useState"]);
-    }
-
-    #[test]
-    fn test_multiple_imports_same_line() {
-        let source = r#"import A from 'a'; import B from 'b';"#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 2);
-        assert!(imports.iter().any(|i| i.package_name == "a"));
-        assert!(imports.iter().any(|i| i.package_name == "b"));
-    }
-
-    #[test]
-    fn test_import_with_subpath() {
-        let source = r#"import { thing } from 'package/subpath';"#;
-        let imports = analyze_js(source);
-
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].package_name, "package/subpath");
+        assert_eq!(imports[0].source, "lodash");
+        assert_eq!(imports[0].kind, ImportKind::DynamicImport);
     }
 }

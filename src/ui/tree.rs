@@ -25,6 +25,10 @@ pub struct TreeNode {
     pub is_in_cycle: bool,
     /// Whether this node has a version conflict
     pub has_conflict: bool,
+    /// Bundle size in bytes (from webpack/bundler stats)
+    pub bundle_size: Option<u64>,
+    /// Number of modules from this package included in the bundle
+    pub module_count: Option<usize>,
 }
 
 impl TreeNode {
@@ -39,6 +43,8 @@ impl TreeNode {
             dep_type: None,
             is_in_cycle: false,
             has_conflict: false,
+            bundle_size: None,
+            module_count: None,
         }
     }
 
@@ -54,6 +60,8 @@ impl TreeNode {
             dep_type: None,
             is_in_cycle: false,
             has_conflict: false,
+            bundle_size: None,
+            module_count: None,
         }
     }
 
@@ -68,6 +76,51 @@ impl TreeNode {
             dep_type: Some(dep_type),
             is_in_cycle: false,
             has_conflict: false,
+            bundle_size: None,
+            module_count: None,
+        }
+    }
+
+    /// Create a new tree node with bundle size information
+    pub fn with_bundle_size(
+        name: String,
+        version: String,
+        bundle_size: u64,
+        module_count: usize,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            children: Vec::new(),
+            expanded: false,
+            depth: 0,
+            dep_type: None,
+            is_in_cycle: false,
+            has_conflict: false,
+            bundle_size: Some(bundle_size),
+            module_count: Some(module_count),
+        }
+    }
+
+    /// Set bundle size information for this node
+    pub fn set_bundle_size(&mut self, size: u64, module_count: usize) {
+        self.bundle_size = Some(size);
+        self.module_count = Some(module_count);
+    }
+
+    /// Returns true if this node has bundle size information
+    pub fn has_bundle_size(&self) -> bool {
+        self.bundle_size.is_some()
+    }
+
+    /// Apply bundle sizes from a map to this node and all children recursively
+    pub fn apply_bundle_sizes(&mut self, sizes: &std::collections::HashMap<String, (u64, usize)>) {
+        if let Some(&(size, count)) = sizes.get(&self.name) {
+            self.bundle_size = Some(size);
+            self.module_count = Some(count);
+        }
+        for child in &mut self.children {
+            child.apply_bundle_sizes(sizes);
         }
     }
 
@@ -131,6 +184,8 @@ impl TreeNode {
             dep_type: self.dep_type,
             is_in_cycle: self.is_in_cycle,
             has_conflict: self.has_conflict,
+            bundle_size: self.bundle_size,
+            module_count: self.module_count,
         });
 
         if self.expanded {
@@ -193,6 +248,10 @@ pub struct FlattenedNode {
     pub is_in_cycle: bool,
     /// Whether this node has a version conflict
     pub has_conflict: bool,
+    /// Bundle size in bytes (from webpack/bundler stats)
+    pub bundle_size: Option<u64>,
+    /// Number of modules from this package included in the bundle
+    pub module_count: Option<usize>,
 }
 
 impl FlattenedNode {
@@ -233,6 +292,33 @@ impl FlattenedNode {
         }
 
         prefix
+    }
+
+    /// Returns true if this node has bundle size information
+    pub fn has_bundle_size(&self) -> bool {
+        self.bundle_size.is_some()
+    }
+
+    /// Format the bundle size as a human-readable string
+    pub fn format_bundle_size(&self) -> Option<String> {
+        self.bundle_size.map(format_size)
+    }
+}
+
+/// Format a byte size as a human-readable string.
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -334,6 +420,8 @@ mod tests {
             dep_type: None,
             is_in_cycle: false,
             has_conflict: false,
+            bundle_size: None,
+            module_count: None,
         };
         assert_eq!(node_with_children.expansion_indicator(), "▶ ");
 
@@ -442,5 +530,137 @@ mod tests {
         assert_eq!(flattened.len(), 2);
         assert!(!flattened[0].has_conflict); // project
         assert!(flattened[1].has_conflict); // lodash
+    }
+
+    // Bundle size tests
+    #[test]
+    fn test_tree_node_with_bundle_size() {
+        let node = TreeNode::with_bundle_size(
+            "react".to_string(),
+            "18.0.0".to_string(),
+            10000,
+            5,
+        );
+        assert_eq!(node.name, "react");
+        assert_eq!(node.bundle_size, Some(10000));
+        assert_eq!(node.module_count, Some(5));
+        assert!(node.has_bundle_size());
+    }
+
+    #[test]
+    fn test_tree_node_set_bundle_size() {
+        let mut node = TreeNode::new("react".to_string(), "18.0.0".to_string());
+        assert!(!node.has_bundle_size());
+        assert_eq!(node.bundle_size, None);
+
+        node.set_bundle_size(5000, 3);
+        assert!(node.has_bundle_size());
+        assert_eq!(node.bundle_size, Some(5000));
+        assert_eq!(node.module_count, Some(3));
+    }
+
+    #[test]
+    fn test_apply_bundle_sizes_to_tree() {
+        let mut root = TreeNode::new("my-app".to_string(), "1.0.0".to_string());
+        let react = TreeNode::new("react".to_string(), "18.0.0".to_string());
+        let lodash = TreeNode::new("lodash".to_string(), "4.17.0".to_string());
+        root.add_child(react);
+        root.add_child(lodash);
+
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("react".to_string(), (10000_u64, 5_usize));
+        sizes.insert("lodash".to_string(), (25000_u64, 10_usize));
+
+        root.apply_bundle_sizes(&sizes);
+
+        assert_eq!(root.bundle_size, None);
+        assert_eq!(root.children[0].bundle_size, Some(10000));
+        assert_eq!(root.children[0].module_count, Some(5));
+        assert_eq!(root.children[1].bundle_size, Some(25000));
+        assert_eq!(root.children[1].module_count, Some(10));
+    }
+
+    #[test]
+    fn test_apply_bundle_sizes_recursive() {
+        let mut root = TreeNode::new("my-app".to_string(), "1.0.0".to_string());
+        let mut react = TreeNode::new("react".to_string(), "18.0.0".to_string());
+        let scheduler = TreeNode::new("scheduler".to_string(), "0.23.0".to_string());
+        react.add_child(scheduler);
+        root.add_child(react);
+
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("react".to_string(), (10000_u64, 5_usize));
+        sizes.insert("scheduler".to_string(), (500_u64, 2_usize));
+
+        root.apply_bundle_sizes(&sizes);
+
+        assert_eq!(root.children[0].bundle_size, Some(10000)); // react
+        assert_eq!(root.children[0].children[0].bundle_size, Some(500)); // scheduler
+    }
+
+    #[test]
+    fn test_flatten_includes_bundle_size() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let mut react = TreeNode::new("react".to_string(), "18.0.0".to_string());
+        react.bundle_size = Some(10000);
+        react.module_count = Some(5);
+        root.add_child(react);
+        root.expanded = true;
+
+        let flattened = root.flatten();
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].bundle_size, None);
+        assert_eq!(flattened[1].bundle_size, Some(10000));
+        assert_eq!(flattened[1].module_count, Some(5));
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1536), "1.50 KB");
+        assert_eq!(format_size(1048576), "1.00 MB");
+        assert_eq!(format_size(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_flattened_node_format_bundle_size() {
+        let node = FlattenedNode {
+            name: "react".to_string(),
+            version: "18.0.0".to_string(),
+            depth: 0,
+            is_expanded: false,
+            has_children: false,
+            is_last_child: false,
+            dep_type: None,
+            is_in_cycle: false,
+            has_conflict: false,
+            bundle_size: Some(1048576),
+            module_count: Some(5),
+        };
+
+        assert!(node.has_bundle_size());
+        assert_eq!(node.format_bundle_size(), Some("1.00 MB".to_string()));
+    }
+
+    #[test]
+    fn test_flattened_node_no_bundle_size() {
+        let node = FlattenedNode {
+            name: "react".to_string(),
+            version: "18.0.0".to_string(),
+            depth: 0,
+            is_expanded: false,
+            has_children: false,
+            is_last_child: false,
+            dep_type: None,
+            is_in_cycle: false,
+            has_conflict: false,
+            bundle_size: None,
+            module_count: None,
+        };
+
+        assert!(!node.has_bundle_size());
+        assert_eq!(node.format_bundle_size(), None);
     }
 }
