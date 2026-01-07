@@ -26,12 +26,18 @@ pub struct App {
     pub selected_index: usize,
     /// Flattened representation for rendering
     pub flattened: Vec<FlattenedNode>,
+    /// Filtered flattened view (when search is active)
+    pub filtered: Vec<FlattenedNode>,
     /// Track which ancestors are "last child" for proper tree drawing
     ancestors_last: Vec<bool>,
     /// Whether the application should quit
     pub should_quit: bool,
     /// List state for ratatui
     list_state: ListState,
+    /// Whether search mode is active
+    pub search_active: bool,
+    /// Current search query
+    pub search_query: String,
 }
 
 impl App {
@@ -41,9 +47,12 @@ impl App {
             tree: root,
             selected_index: 0,
             flattened: Vec::new(),
+            filtered: Vec::new(),
             ancestors_last: Vec::new(),
             should_quit: false,
             list_state: ListState::default(),
+            search_active: false,
+            search_query: String::new(),
         };
         app.refresh_flattened();
         app.list_state.select(Some(0));
@@ -157,6 +166,80 @@ impl App {
 
         prefix
     }
+
+    /// Start search mode
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+    }
+
+    /// Clear search and return to normal mode
+    pub fn clear_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.filtered.clear();
+        // Reset selection to first item
+        self.selected_index = 0;
+        self.list_state.select(Some(0));
+    }
+
+    /// Add a character to the search query
+    pub fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.update_filter();
+    }
+
+    /// Remove the last character from the search query
+    pub fn search_pop(&mut self) {
+        self.search_query.pop();
+        self.update_filter();
+    }
+
+    /// Update the filtered view based on the current search query
+    fn update_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered.clear();
+            self.selected_index = 0;
+        } else {
+            self.filtered = self
+                .flattened
+                .iter()
+                .filter(|node| fuzzy_match(&node.name, &self.search_query))
+                .cloned()
+                .collect();
+
+            // Reset selection if current selection is out of bounds
+            if !self.filtered.is_empty() {
+                self.selected_index = 0;
+            }
+        }
+        self.list_state.select(Some(self.selected_index));
+    }
+
+}
+
+/// Perform fuzzy matching of query against text (case-insensitive)
+/// A match requires all characters of the query to appear in order in the text
+fn fuzzy_match(text: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    let mut query_chars = query_lower.chars().peekable();
+    for c in text_lower.chars() {
+        if let Some(&q) = query_chars.peek() {
+            if c == q {
+                query_chars.next();
+            }
+        }
+        if query_chars.peek().is_none() {
+            return true;
+        }
+    }
+    query_chars.peek().is_none()
 }
 
 /// Get the color for a dependency type
@@ -200,12 +283,38 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
 
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-                    KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                    KeyCode::Char('k') | KeyCode::Up => app.select_previous(),
-                    KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected(),
-                    _ => {}
+                if app.search_active {
+                    // Search mode key handling
+                    match key.code {
+                        KeyCode::Esc => app.clear_search(),
+                        KeyCode::Enter => {
+                            // Exit search mode but keep the filter active
+                            app.search_active = false;
+                        }
+                        KeyCode::Backspace => app.search_pop(),
+                        KeyCode::Char(c) => app.search_push(c),
+                        KeyCode::Down | KeyCode::Tab => app.select_next(),
+                        KeyCode::Up | KeyCode::BackTab => app.select_previous(),
+                        _ => {}
+                    }
+                } else {
+                    // Normal mode key handling
+                    match key.code {
+                        KeyCode::Char('q') => app.quit(),
+                        KeyCode::Esc => {
+                            if !app.search_query.is_empty() {
+                                // Clear the filter but stay in normal mode
+                                app.clear_search();
+                            } else {
+                                app.quit();
+                            }
+                        }
+                        KeyCode::Char('/') => app.start_search(),
+                        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                        KeyCode::Char('k') | KeyCode::Up => app.select_previous(),
+                        KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected(),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -218,18 +327,40 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
 
 /// Render the application UI
 fn render(frame: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
+    // Determine if search bar is visible
+    let show_search = app.search_active || !app.search_query.is_empty();
 
-    render_header(frame, chunks[0]);
-    render_tree(frame, app, chunks[1]);
-    render_footer(frame, chunks[2]);
+    let chunks = if show_search {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Length(3), // Search bar
+                Constraint::Min(0),    // Tree
+                Constraint::Length(3), // Footer
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(0),    // Tree
+                Constraint::Length(3), // Footer
+            ])
+            .split(frame.area())
+    };
+
+    if show_search {
+        render_header(frame, chunks[0]);
+        render_search_bar(frame, app, chunks[1]);
+        render_tree(frame, app, chunks[2]);
+        render_footer(frame, app, chunks[3]);
+    } else {
+        render_header(frame, chunks[0]);
+        render_tree(frame, app, chunks[1]);
+        render_footer(frame, app, chunks[2]);
+    }
 }
 
 /// Render the header
@@ -244,35 +375,96 @@ fn render_header(frame: &mut Frame, area: Rect) {
     frame.render_widget(header, area);
 }
 
+/// Render the search bar
+fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let (border_color, title) = if app.search_active {
+        (Color::Yellow, "Search (Enter to confirm, Esc to cancel)")
+    } else {
+        (Color::Gray, "Filter (/ to edit, Esc to clear)")
+    };
+
+    let search_display = format!("/{}", app.search_query);
+    let cursor = if app.search_active { "_" } else { "" };
+
+    let result_count = if !app.search_query.is_empty() {
+        format!(" ({} matches)", app.filtered.len())
+    } else {
+        String::new()
+    };
+
+    let content = Line::from(vec![
+        Span::styled(&search_display, Style::default().fg(Color::White)),
+        Span::styled(cursor, Style::default().fg(Color::Yellow).add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled(&result_count, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let search_bar = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        );
+    frame.render_widget(search_bar, area);
+}
+
 /// Render the dependency tree
 pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .flattened
+    // Clone what we need to avoid borrowing issues
+    let has_search = !app.search_query.is_empty();
+    let search_query = app.search_query.clone();
+
+    // Get the nodes to display - clone to avoid borrow issues
+    let display_nodes: Vec<FlattenedNode> = if has_search {
+        app.filtered.clone()
+    } else {
+        app.flattened.clone()
+    };
+
+    let items: Vec<ListItem> = display_nodes
         .iter()
         .enumerate()
         .map(|(index, node)| {
-            let prefix = app.get_tree_prefix(index);
+            // Only show tree prefix for non-filtered views
+            let prefix = if has_search {
+                String::new()
+            } else {
+                app.get_tree_prefix(index)
+            };
             let indicator = node.expansion_indicator();
             let dep_color = get_dep_type_color(node.dep_type);
             let type_indicator = get_dep_type_indicator(node.dep_type);
 
-            let content = Line::from(vec![
+            // Build the name with highlighting if there's a search query
+            let name_spans = if has_search {
+                highlight_matches(&node.name, &search_query, dep_color)
+            } else {
+                vec![Span::styled(node.name.clone(), Style::default().fg(dep_color))]
+            };
+
+            let mut content_spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(indicator, Style::default().fg(Color::Yellow)),
                 Span::styled(type_indicator, Style::default().fg(dep_color)),
-                Span::styled(&node.name, Style::default().fg(dep_color)),
-                Span::styled(
-                    format!(" @{}", node.version),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
+            ];
+            content_spans.extend(name_spans);
+            content_spans.push(Span::styled(
+                format!(" @{}", node.version),
+                Style::default().fg(Color::DarkGray),
+            ));
 
-            ListItem::new(content)
+            ListItem::new(Line::from(content_spans))
         })
         .collect();
 
+    let title = if has_search {
+        format!("Dependencies (filtered: {} matches)", display_nodes.len())
+    } else {
+        "Dependencies".to_string()
+    };
+
     let tree_block = Block::default()
-        .title("Dependencies")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Gray));
 
@@ -288,26 +480,95 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(tree_list, area, &mut app.list_state);
 }
 
+/// Highlight matching characters in a string based on fuzzy search
+fn highlight_matches(text: &str, query: &str, base_color: Color) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::styled(text.to_string(), Style::default().fg(base_color))];
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut result = Vec::new();
+    let mut current_segment = String::new();
+    let mut current_is_match = false;
+    let mut query_chars = query_lower.chars().peekable();
+
+    for c in text.chars() {
+        let c_lower = c.to_lowercase().next().unwrap_or(c);
+        let is_match = query_chars.peek().is_some_and(|&q| c_lower == q);
+
+        if is_match {
+            query_chars.next();
+        }
+
+        if is_match != current_is_match && !current_segment.is_empty() {
+            // Push the current segment
+            let style = if current_is_match {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(base_color)
+            };
+            result.push(Span::styled(current_segment.clone(), style));
+            current_segment.clear();
+        }
+
+        current_segment.push(c);
+        current_is_match = is_match;
+    }
+
+    // Push the final segment
+    if !current_segment.is_empty() {
+        let style = if current_is_match {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(base_color)
+        };
+        result.push(Span::styled(current_segment, style));
+    }
+
+    result
+}
+
 /// Render the footer with help text and legend
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let help_text = Line::from(vec![
-        Span::styled("j/↓", Style::default().fg(Color::Yellow)),
-        Span::raw(" Down  "),
-        Span::styled("k/↑", Style::default().fg(Color::Yellow)),
-        Span::raw(" Up  "),
-        Span::styled("Enter/Space", Style::default().fg(Color::Yellow)),
-        Span::raw(" Toggle  "),
-        Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" Quit  │  "),
-        Span::styled("[P]", Style::default().fg(Color::Green)),
-        Span::raw(" Prod  "),
-        Span::styled("[D]", Style::default().fg(Color::Yellow)),
-        Span::raw(" Dev  "),
-        Span::styled("[Pe]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Peer  "),
-        Span::styled("[O]", Style::default().fg(Color::Gray)),
-        Span::raw(" Optional"),
-    ]);
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let help_text = if app.search_active {
+        // Search mode help
+        Line::from(vec![
+            Span::styled("Type", Style::default().fg(Color::Yellow)),
+            Span::raw(" to search  "),
+            Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" Navigate  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" Confirm  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" Cancel"),
+        ])
+    } else {
+        // Normal mode help with search shortcut
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(" Search  "),
+            Span::styled("j/↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" Down  "),
+            Span::styled("k/↑", Style::default().fg(Color::Yellow)),
+            Span::raw(" Up  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" Toggle  "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(" Quit  │  "),
+            Span::styled("[P]", Style::default().fg(Color::Green)),
+            Span::raw(" Prod  "),
+            Span::styled("[D]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Dev  "),
+            Span::styled("[Pe]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Peer  "),
+            Span::styled("[O]", Style::default().fg(Color::Gray)),
+            Span::raw(" Opt"),
+        ])
+    };
 
     let footer = Paragraph::new(help_text)
         .style(Style::default().fg(Color::Gray))
@@ -400,5 +661,99 @@ mod tests {
 
         app.quit();
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_fuzzy_match() {
+        // Exact match
+        assert!(fuzzy_match("react", "react"));
+
+        // Partial match (substring)
+        assert!(fuzzy_match("react", "re"));
+
+        // Fuzzy match (characters in order)
+        assert!(fuzzy_match("react", "rct"));
+
+        // Case insensitive
+        assert!(fuzzy_match("react", "REACT"));
+        assert!(fuzzy_match("React", "react"));
+
+        // No match
+        assert!(!fuzzy_match("react", "xyz"));
+
+        // Empty query matches everything
+        assert!(fuzzy_match("react", ""));
+
+        // Query longer than text
+        assert!(!fuzzy_match("re", "react"));
+    }
+
+    #[test]
+    fn test_search_start_and_clear() {
+        let mut app = create_test_app();
+
+        // Initially not in search mode
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
+
+        // Start search
+        app.start_search();
+        assert!(app.search_active);
+        assert!(app.search_query.is_empty());
+
+        // Type something
+        app.search_push('r');
+        app.search_push('e');
+        assert_eq!(app.search_query, "re");
+
+        // Clear search
+        app.clear_search();
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
+        assert!(app.filtered.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtering() {
+        let mut app = create_test_app();
+
+        // Expand react to add react-dom
+        app.selected_index = 1;
+        app.list_state.select(Some(1));
+        app.toggle_selected();
+        assert_eq!(app.flattened.len(), 4); // my-project, react, react-dom, lodash
+
+        // Start search and type "react"
+        app.start_search();
+        app.search_push('r');
+        app.search_push('e');
+        app.search_push('a');
+        app.search_push('c');
+        app.search_push('t');
+
+        // Should match "react" and "react-dom" (both contain "react")
+        assert_eq!(app.filtered.len(), 2);
+        assert!(app.filtered.iter().any(|n| n.name == "react"));
+        assert!(app.filtered.iter().any(|n| n.name == "react-dom"));
+    }
+
+    #[test]
+    fn test_search_pop() {
+        let mut app = create_test_app();
+        app.start_search();
+
+        app.search_push('r');
+        app.search_push('e');
+        assert_eq!(app.search_query, "re");
+
+        app.search_pop();
+        assert_eq!(app.search_query, "r");
+
+        app.search_pop();
+        assert!(app.search_query.is_empty());
+
+        // Pop on empty doesn't panic
+        app.search_pop();
+        assert!(app.search_query.is_empty());
     }
 }
