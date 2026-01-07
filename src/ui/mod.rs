@@ -7,4 +7,4 @@ mod app;
 pub mod tree;
 
 pub use app::{run_app, App};
-pub use tree::TreeNode;
+pub use tree::{TreeNode, format_size};

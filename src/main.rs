@@ -11,7 +11,7 @@ use ratatui::prelude::*;
 
 use codescope::graph::{self, DependencyGraph};
 use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
-use codescope::ui::{run_app, App, TreeNode};
+use codescope::ui::{run_app, App, TreeNode, format_size};
 
 #[derive(Parser)]
 #[command(name = "codescope")]
@@ -136,7 +136,8 @@ fn main() -> io::Result<()> {
 
             if *no_tui {
                 // Print tree to stdout
-                print_tree(&tree, 0);
+                let total_bundle_size = calculate_tree_total_bundle_size(&tree);
+                print_tree(&tree, 0, total_bundle_size);
                 return Ok(());
             }
 
@@ -280,7 +281,7 @@ fn build_dependency_graph(deps: &[parser::Dependency]) -> DependencyGraph {
 }
 
 /// Print tree to stdout (for --no-tui mode)
-fn print_tree(node: &TreeNode, depth: usize) {
+fn print_tree(node: &TreeNode, depth: usize, total_bundle_size: u64) {
     let indent = "  ".repeat(depth);
     let indicator = if node.children.is_empty() {
         "  "
@@ -305,15 +306,36 @@ fn print_tree(node: &TreeNode, depth: usize) {
     // Get conflict indicator
     let conflict_indicator = if node.has_conflict { "[~] " } else { "" };
 
+    // Get bundle size indicator
+    let size_indicator = if let Some(size) = node.bundle_size {
+        if total_bundle_size > 0 {
+            let percentage = (size as f64 / total_bundle_size as f64) * 100.0;
+            format!(" [{} ({:.1}%)]", format_size(size), percentage)
+        } else {
+            format!(" [{}]", format_size(size))
+        }
+    } else {
+        String::new()
+    };
+
     if node.version.is_empty() {
         println!("{}{}{}", indent, indicator, node.name);
     } else {
-        println!("{}{}{}{}{}{} @ {}", indent, indicator, cycle_indicator, conflict_indicator, type_indicator, node.name, node.version);
+        println!("{}{}{}{}{}{} @ {}{}", indent, indicator, cycle_indicator, conflict_indicator, type_indicator, node.name, node.version, size_indicator);
     }
 
     if node.expanded || depth == 0 {
         for child in &node.children {
-            print_tree(child, depth + 1);
+            print_tree(child, depth + 1, total_bundle_size);
         }
     }
+}
+
+/// Calculate total bundle size from a tree
+fn calculate_tree_total_bundle_size(node: &TreeNode) -> u64 {
+    let mut total = node.bundle_size.unwrap_or(0);
+    for child in &node.children {
+        total += calculate_tree_total_bundle_size(child);
+    }
+    total
 }

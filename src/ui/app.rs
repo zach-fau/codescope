@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::parser::types::DependencyType;
-use super::tree::{FlattenedNode, TreeNode};
+use super::tree::{FlattenedNode, TreeNode, format_size};
 
 /// Virtual scroll state for efficient rendering of large trees
 #[derive(Debug, Default, Clone)]
@@ -503,6 +503,44 @@ fn get_conflict_indicator(has_conflict: bool) -> &'static str {
     }
 }
 
+/// Size thresholds for color coding (in bytes)
+const SIZE_LARGE_THRESHOLD: u64 = 500 * 1024; // 500KB
+const SIZE_MEDIUM_THRESHOLD: u64 = 100 * 1024; // 100KB
+
+/// Get the color for a bundle size based on thresholds
+///
+/// Returns the appropriate color based on size:
+/// - Red: Large (> 500KB)
+/// - Yellow: Medium (100KB - 500KB)
+/// - Green: Small (< 100KB)
+fn get_size_color(bytes: u64) -> Color {
+    if bytes >= SIZE_LARGE_THRESHOLD {
+        Color::Red
+    } else if bytes >= SIZE_MEDIUM_THRESHOLD {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Calculate the total bundle size from all nodes in a flattened tree
+fn calculate_total_bundle_size(nodes: &[FlattenedNode]) -> u64 {
+    nodes.iter()
+        .filter_map(|n| n.bundle_size)
+        .sum()
+}
+
+/// Format the size with percentage of total bundle
+fn format_size_with_percentage(bytes: u64, total: u64) -> String {
+    let size_str = format_size(bytes);
+    if total > 0 {
+        let percentage = (bytes as f64 / total as f64) * 100.0;
+        format!("{} ({:.1}%)", size_str, percentage)
+    } else {
+        size_str
+    }
+}
+
 /// Run the TUI application
 pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
@@ -658,6 +696,9 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let total_nodes = display_nodes.len();
 
+    // Calculate total bundle size for percentage display
+    let total_bundle_size = calculate_total_bundle_size(display_nodes);
+
     // Calculate viewport height (area height minus borders)
     // Border takes 2 rows (top + bottom)
     let viewport_height = (area.height as usize).saturating_sub(2);
@@ -715,6 +756,16 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 format!(" @{}", node.version),
                 Style::default().fg(Color::DarkGray),
             ));
+
+            // Add bundle size column if available
+            if let Some(size) = node.bundle_size {
+                let size_color = get_size_color(size);
+                let size_str = format_size_with_percentage(size, total_bundle_size);
+                content_spans.push(Span::styled(
+                    format!("  [{}]", size_str),
+                    Style::default().fg(size_color),
+                ));
+            }
 
             ListItem::new(Line::from(content_spans))
         })
@@ -844,7 +895,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[!]", Style::default().fg(Color::Red)),
             Span::raw(" Cycle  "),
             Span::styled("L#", Style::default().fg(Color::Rgb(100, 149, 237))),
-            Span::raw(" Depth"),
+            Span::raw(" Depth  │  Size: "),
+            Span::styled(">500K", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::styled("100-500K", Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled("<100K", Style::default().fg(Color::Green)),
         ])
     };
 
@@ -1179,5 +1235,124 @@ mod tests {
         app.start_search();
         app.search_push('r');
         assert_eq!(app.current_list_len(), app.filtered.len());
+    }
+
+    // Bundle size display tests
+
+    #[test]
+    fn test_get_size_color_large() {
+        // > 500KB should be red
+        let large_size = 600 * 1024; // 600KB
+        assert_eq!(get_size_color(large_size), Color::Red);
+
+        // Exactly 500KB should be red
+        let exact_large = 500 * 1024;
+        assert_eq!(get_size_color(exact_large), Color::Red);
+    }
+
+    #[test]
+    fn test_get_size_color_medium() {
+        // 100KB - 500KB should be yellow
+        let medium_size = 250 * 1024; // 250KB
+        assert_eq!(get_size_color(medium_size), Color::Yellow);
+
+        // Exactly 100KB should be yellow
+        let exact_medium = 100 * 1024;
+        assert_eq!(get_size_color(exact_medium), Color::Yellow);
+    }
+
+    #[test]
+    fn test_get_size_color_small() {
+        // < 100KB should be green
+        let small_size = 50 * 1024; // 50KB
+        assert_eq!(get_size_color(small_size), Color::Green);
+
+        // Very small
+        let tiny_size = 1024; // 1KB
+        assert_eq!(get_size_color(tiny_size), Color::Green);
+
+        // Zero bytes
+        assert_eq!(get_size_color(0), Color::Green);
+    }
+
+    #[test]
+    fn test_calculate_total_bundle_size() {
+        let nodes = vec![
+            FlattenedNode {
+                name: "react".to_string(),
+                version: "18.0.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: Some(10000),
+                module_count: Some(5),
+            },
+            FlattenedNode {
+                name: "lodash".to_string(),
+                version: "4.17.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: Some(25000),
+                module_count: Some(10),
+            },
+            FlattenedNode {
+                name: "no-size".to_string(),
+                version: "1.0.0".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_last_child: false,
+                dep_type: None,
+                is_in_cycle: false,
+                has_conflict: false,
+                bundle_size: None,
+                module_count: None,
+            },
+        ];
+
+        let total = calculate_total_bundle_size(&nodes);
+        assert_eq!(total, 35000);
+    }
+
+    #[test]
+    fn test_calculate_total_bundle_size_empty() {
+        let nodes: Vec<FlattenedNode> = vec![];
+        assert_eq!(calculate_total_bundle_size(&nodes), 0);
+    }
+
+    #[test]
+    fn test_format_size_with_percentage() {
+        // Test with percentage
+        let result = format_size_with_percentage(10240, 102400);
+        assert!(result.contains("10.00 KB"));
+        assert!(result.contains("10.0%"));
+
+        // Test with zero total (edge case)
+        let result = format_size_with_percentage(10240, 0);
+        assert_eq!(result, "10.00 KB");
+    }
+
+    #[test]
+    fn test_format_size_with_percentage_large() {
+        // 1MB out of 2MB = 50%
+        let result = format_size_with_percentage(1048576, 2097152);
+        assert!(result.contains("1.00 MB"));
+        assert!(result.contains("50.0%"));
+    }
+
+    #[test]
+    fn test_size_thresholds() {
+        // Verify threshold constants
+        assert_eq!(SIZE_LARGE_THRESHOLD, 500 * 1024);
+        assert_eq!(SIZE_MEDIUM_THRESHOLD, 100 * 1024);
     }
 }
