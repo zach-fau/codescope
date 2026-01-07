@@ -26,9 +26,13 @@
 //! }
 //! ```
 
+pub mod savings;
 pub mod webpack;
 
 // Re-export main types for convenience
+pub use savings::{
+    PackageSavings, SavingsCalculator, SavingsCategory, SavingsReport, SavingsSummary,
+};
 pub use webpack::{
     extract_package_name, format_size, BundleAnalysis, PackageBundleSize, WebpackAsset,
     WebpackChunk, WebpackModule, WebpackStats,

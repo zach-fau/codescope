@@ -9,6 +9,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
+use codescope::bundle::savings::{SavingsCalculator, SavingsReport};
 use codescope::graph::{self, DependencyGraph};
 use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
 use codescope::ui::{run_app, App, TreeNode, format_size, SortMode};
@@ -50,6 +51,16 @@ enum Commands {
         /// Sort dependencies by bundle size (largest first) instead of alphabetically
         #[arg(long)]
         sort_by_size: bool,
+
+        /// Generate a bundle size savings report (for CI usage)
+        /// Shows potential savings from removing unused/underutilized dependencies
+        #[arg(long)]
+        savings_report: bool,
+
+        /// Set a minimum savings threshold in KB for CI checks
+        /// Exit with code 1 if potential savings exceed this threshold
+        #[arg(long, value_name = "KB")]
+        savings_threshold: Option<u64>,
     },
     /// Show version information
     Version,
@@ -66,6 +77,8 @@ fn main() -> io::Result<()> {
             check_cycles,
             check_conflicts,
             sort_by_size,
+            savings_report,
+            savings_threshold,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -124,6 +137,34 @@ fn main() -> io::Result<()> {
                     eprintln!("Found {} version conflict(s).", conflicts.len());
                     std::process::exit(1);
                 }
+            }
+
+            // Handle --savings-report flag (for CI usage)
+            if *savings_report {
+                let report = generate_savings_report(&deps);
+                print!("{}", report.format_report());
+
+                // Check threshold if specified
+                if let Some(threshold_kb) = savings_threshold {
+                    let threshold_bytes = threshold_kb * 1024;
+                    if report.summary.total_potential_savings > threshold_bytes {
+                        eprintln!();
+                        eprintln!(
+                            "❌ Potential savings ({}) exceed threshold ({} KB)!",
+                            report.summary.format_total_savings(),
+                            threshold_kb
+                        );
+                        std::process::exit(1);
+                    } else {
+                        println!();
+                        println!(
+                            "✅ Potential savings ({}) are within threshold ({} KB).",
+                            report.summary.format_total_savings(),
+                            threshold_kb
+                        );
+                    }
+                }
+                return Ok(());
             }
 
             // Build tree structure
@@ -348,4 +389,68 @@ fn calculate_tree_total_bundle_size(node: &TreeNode) -> u64 {
         total += calculate_tree_total_bundle_size(child);
     }
     total
+}
+
+/// Generate a savings report from parsed dependencies
+///
+/// This creates a mock bundle analysis from the dependency list since we don't
+/// have actual webpack stats. For real bundle size data, use --with-bundle-size
+/// with a stats.json file.
+fn generate_savings_report(deps: &[parser::Dependency]) -> SavingsReport {
+    use std::collections::HashMap;
+    use codescope::bundle::webpack::{BundleAnalysis, PackageBundleSize};
+    use codescope::analysis::exports::ProjectImports;
+
+    // Create a mock bundle analysis from dependencies
+    // In a real implementation, this would come from webpack stats
+    let mut analysis = BundleAnalysis::default();
+
+    // Use estimated sizes based on common package sizes
+    // This is a heuristic - real sizes would come from webpack stats
+    let estimated_sizes: HashMap<&str, u64> = [
+        ("react", 45 * 1024),
+        ("react-dom", 120 * 1024),
+        ("lodash", 70 * 1024),
+        ("moment", 290 * 1024),
+        ("axios", 15 * 1024),
+        ("express", 200 * 1024),
+        ("webpack", 100 * 1024),
+        ("typescript", 10 * 1024), // TypeScript is dev-only, minimal bundle impact
+        ("@types/", 0), // Type definitions have no runtime cost
+        ("eslint", 0), // Dev dependency
+        ("jest", 0), // Dev dependency
+        ("prettier", 0), // Dev dependency
+    ].into_iter().collect();
+
+    let default_size = 25 * 1024; // 25KB default estimate
+
+    for dep in deps {
+        // Skip dev dependencies for bundle size (they don't affect runtime bundle)
+        if matches!(dep.dep_type, DependencyType::Development) {
+            continue;
+        }
+
+        // Estimate size based on known packages or use default
+        let size = estimated_sizes
+            .iter()
+            .find(|(name, _)| dep.name.starts_with(*name))
+            .map(|(_, size)| *size)
+            .unwrap_or(default_size);
+
+        if size > 0 {
+            let mut pkg = PackageBundleSize::new(&dep.name);
+            pkg.add_module(format!("{}/index.js", dep.name), size);
+            analysis.package_sizes.insert(dep.name.clone(), pkg);
+            analysis.total_module_size += size;
+        }
+    }
+
+    // Create empty project imports (no source analysis in this mode)
+    // In a real implementation, we'd analyze the source code
+    let project_imports = ProjectImports::new();
+    let export_counts = HashMap::new();
+
+    // Calculate savings
+    let calculator = SavingsCalculator::new();
+    calculator.calculate(&analysis, &project_imports, &export_counts)
 }

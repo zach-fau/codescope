@@ -15,6 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::bundle::savings::{SavingsReport, SavingsCategory};
 use crate::parser::types::DependencyType;
 use super::tree::{FlattenedNode, TreeNode, format_size};
 
@@ -138,6 +139,10 @@ pub struct App {
     pub scroll_state: VirtualScrollState,
     /// Current sort mode for the dependency list
     pub sort_mode: SortMode,
+    /// Savings report (optional, set when savings analysis is enabled)
+    pub savings_report: Option<SavingsReport>,
+    /// Whether to show the savings panel
+    pub show_savings_panel: bool,
 }
 
 impl App {
@@ -160,10 +165,29 @@ impl App {
             search_query: String::new(),
             scroll_state: VirtualScrollState::new(),
             sort_mode,
+            savings_report: None,
+            show_savings_panel: false,
         };
         app.refresh_flattened();
         app.list_state.select(Some(0));
         app
+    }
+
+    /// Set the savings report for display
+    pub fn set_savings_report(&mut self, report: SavingsReport) {
+        self.savings_report = Some(report);
+    }
+
+    /// Toggle the savings panel visibility
+    pub fn toggle_savings_panel(&mut self) {
+        if self.savings_report.is_some() {
+            self.show_savings_panel = !self.show_savings_panel;
+        }
+    }
+
+    /// Check if savings data is available
+    pub fn has_savings_data(&self) -> bool {
+        self.savings_report.is_some()
     }
 
     /// Refresh the flattened view from the tree
@@ -665,7 +689,10 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                     match key.code {
                         KeyCode::Char('q') => app.quit(),
                         KeyCode::Esc => {
-                            if !app.search_query.is_empty() {
+                            if app.show_savings_panel {
+                                // Close savings panel first
+                                app.show_savings_panel = false;
+                            } else if !app.search_query.is_empty() {
                                 // Clear the filter but stay in normal mode
                                 app.clear_search();
                             } else {
@@ -683,6 +710,8 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                         KeyCode::End | KeyCode::Char('G') => app.select_last(),
                         // Sort mode toggle
                         KeyCode::Char('s') => app.cycle_sort_mode(),
+                        // Toggle savings panel
+                        KeyCode::Char('i') => app.toggle_savings_panel(),
                         _ => {}
                     }
                 }
@@ -699,7 +728,35 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
 fn render(frame: &mut Frame, app: &mut App) {
     // Determine if search bar is visible
     let show_search = app.search_active || !app.search_query.is_empty();
+    let show_savings = app.show_savings_panel && app.savings_report.is_some();
 
+    // Calculate main layout
+    let main_chunks = if show_savings {
+        // Split horizontally: tree on left, savings panel on right
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(65), // Main content
+                Constraint::Percentage(35), // Savings panel
+            ])
+            .split(frame.area())
+    } else {
+        // Full width for main content
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(frame.area())
+    };
+
+    // Render savings panel if visible
+    if show_savings {
+        if let Some(ref report) = app.savings_report {
+            render_savings_panel(frame, report, main_chunks[1]);
+        }
+    }
+
+    // Calculate vertical layout for main content area
+    let content_area = main_chunks[0];
     let chunks = if show_search {
         Layout::default()
             .direction(Direction::Vertical)
@@ -709,7 +766,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 Constraint::Min(0),    // Tree
                 Constraint::Length(3), // Footer
             ])
-            .split(frame.area())
+            .split(content_area)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
@@ -718,7 +775,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 Constraint::Min(0),    // Tree
                 Constraint::Length(3), // Footer
             ])
-            .split(frame.area())
+            .split(content_area)
     };
 
     if show_search {
@@ -959,6 +1016,126 @@ fn highlight_matches(text: &str, query: &str, base_color: Color) -> Vec<Span<'st
     result
 }
 
+/// Render the savings panel
+fn render_savings_panel(frame: &mut Frame, report: &SavingsReport, area: Rect) {
+    let summary = &report.summary;
+
+    // Create the panel layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // Summary section
+            Constraint::Min(0),    // Package list
+        ])
+        .split(area);
+
+    // Render summary section
+    let savings_pct = summary.savings_percentage();
+    let savings_color = if savings_pct > 30.0 {
+        Color::Red
+    } else if savings_pct > 15.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::raw("Total: "),
+            Span::styled(
+                summary.format_total_bundle_size(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Savings: "),
+            Span::styled(
+                format!("{} ({:.1}%)", summary.format_total_savings(), savings_pct),
+                Style::default().fg(savings_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{}", summary.unused_count),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw(" unused  "),
+            Span::styled(
+                format!("{}", summary.underutilized_count),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" underutil  "),
+            Span::styled(
+                format!("{}", summary.tree_shaking_count),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw(" tree-shake"),
+        ]),
+    ];
+
+    let summary_widget = Paragraph::new(summary_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Potential Savings ")
+                .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        )
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    // Render package list
+    let sorted_savings = report.savings_by_size();
+    let items: Vec<ListItem> = sorted_savings
+        .iter()
+        .take(20) // Limit to top 20 packages
+        .map(|saving| {
+            let category_color = match saving.category {
+                SavingsCategory::Unused => Color::Red,
+                SavingsCategory::Underutilized => Color::Yellow,
+                SavingsCategory::TreeShaking => Color::Blue,
+                SavingsCategory::HasAlternative => Color::Magenta,
+            };
+
+            let category_indicator = match saving.category {
+                SavingsCategory::Unused => "[U]",
+                SavingsCategory::Underutilized => "[<]",
+                SavingsCategory::TreeShaking => "[T]",
+                SavingsCategory::HasAlternative => "[A]",
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    category_indicator,
+                    Style::default().fg(category_color),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    &saving.package_name,
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("-{}", saving.format_potential_savings()),
+                    Style::default().fg(Color::Green),
+                ),
+            ]);
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let packages_widget = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Top Savings ")
+                .title_style(Style::default().fg(Color::White)),
+        )
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(packages_widget, chunks[1]);
+}
+
 /// Render the footer with help text and legend
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = if app.search_active {
@@ -975,15 +1152,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ])
     } else {
         // Normal mode help with search shortcut, sort mode, and page navigation
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" Search  "),
             Span::styled("s", Style::default().fg(Color::Yellow)),
             Span::raw(" Sort  "),
+        ];
+
+        // Add savings panel shortcut if savings data is available
+        if app.has_savings_data() {
+            spans.push(Span::styled("i", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(" Savings  "));
+        }
+
+        spans.extend(vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::raw(" Nav  "),
-            Span::styled("d/u", Style::default().fg(Color::Yellow)),
-            Span::raw(" Page  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" Quit  │  "),
             Span::styled("[P]", Style::default().fg(Color::Green)),
@@ -993,7 +1177,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[!]", Style::default().fg(Color::Red)),
             Span::raw(" Cycle  │  Sort: "),
             Span::styled(app.sort_mode.display_name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ])
+        ]);
+
+        Line::from(spans)
     };
 
     let footer = Paragraph::new(help_text)
