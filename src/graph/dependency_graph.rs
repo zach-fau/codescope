@@ -903,8 +903,8 @@ impl DependencyGraph {
     /// use codescope::graph::{DependencyGraph, Dependency, DependencyType};
     ///
     /// let deps = vec![
-    ///     Dependency::new("react", "18.2.0", DependencyType::Production),
-    ///     Dependency::new("typescript", "5.0.0", DependencyType::Development),
+    ///     Dependency { name: "react".into(), version: "18.2.0".into(), dep_type: DependencyType::Production },
+    ///     Dependency { name: "typescript".into(), version: "5.0.0".into(), dep_type: DependencyType::Development },
     /// ];
     ///
     /// let graph = DependencyGraph::from_dependencies(deps);

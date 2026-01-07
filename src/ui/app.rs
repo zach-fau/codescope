@@ -18,6 +18,70 @@ use ratatui::{
 use crate::parser::types::DependencyType;
 use super::tree::{FlattenedNode, TreeNode};
 
+/// Virtual scroll state for efficient rendering of large trees
+#[derive(Debug, Default, Clone)]
+pub struct VirtualScrollState {
+    /// First visible row index
+    pub offset: usize,
+    /// Number of visible rows in the viewport
+    pub viewport_height: usize,
+}
+
+impl VirtualScrollState {
+    /// Create a new virtual scroll state
+    pub fn new() -> Self {
+        Self {
+            offset: 0,
+            viewport_height: 0,
+        }
+    }
+
+    /// Update the viewport height
+    pub fn set_viewport_height(&mut self, height: usize) {
+        self.viewport_height = height;
+    }
+
+    /// Calculate the visible range for the given selection and total items
+    pub fn visible_range(&self, selected: usize, total: usize) -> (usize, usize) {
+        if total == 0 || self.viewport_height == 0 {
+            return (0, 0);
+        }
+
+        // Ensure selection is visible by adjusting offset
+        let mut offset = self.offset;
+
+        // If selection is above visible area, scroll up
+        if selected < offset {
+            offset = selected;
+        }
+        // If selection is below visible area, scroll down
+        else if selected >= offset + self.viewport_height {
+            offset = selected.saturating_sub(self.viewport_height - 1);
+        }
+
+        let start = offset;
+        let end = (offset + self.viewport_height).min(total);
+
+        (start, end)
+    }
+
+    /// Update offset to ensure selection is visible
+    pub fn ensure_visible(&mut self, selected: usize, total: usize) {
+        if total == 0 || self.viewport_height == 0 {
+            return;
+        }
+
+        // If selection is above visible area, scroll up
+        if selected < self.offset {
+            self.offset = selected;
+        }
+        // If selection is below visible area, scroll down
+        else if selected >= self.offset + self.viewport_height {
+            self.offset = selected.saturating_sub(self.viewport_height - 1);
+        }
+    }
+}
+
 /// Application state
 pub struct App {
     /// The root of the dependency tree
@@ -38,6 +102,8 @@ pub struct App {
     pub search_active: bool,
     /// Current search query
     pub search_query: String,
+    /// Virtual scroll state for performance with large trees
+    pub scroll_state: VirtualScrollState,
 }
 
 impl App {
@@ -53,6 +119,7 @@ impl App {
             list_state: ListState::default(),
             search_active: false,
             search_query: String::new(),
+            scroll_state: VirtualScrollState::new(),
         };
         app.refresh_flattened();
         app.list_state.select(Some(0));
@@ -86,17 +153,72 @@ impl App {
 
     /// Move selection to the next item
     pub fn select_next(&mut self) {
-        if !self.flattened.is_empty() {
-            self.selected_index = (self.selected_index + 1).min(self.flattened.len() - 1);
+        let total = self.current_list_len();
+        if total > 0 {
+            self.selected_index = (self.selected_index + 1).min(total - 1);
             self.list_state.select(Some(self.selected_index));
+            self.scroll_state.ensure_visible(self.selected_index, total);
         }
     }
 
     /// Move selection to the previous item
     pub fn select_previous(&mut self) {
-        if !self.flattened.is_empty() && self.selected_index > 0 {
+        let total = self.current_list_len();
+        if total > 0 && self.selected_index > 0 {
             self.selected_index -= 1;
             self.list_state.select(Some(self.selected_index));
+            self.scroll_state.ensure_visible(self.selected_index, total);
+        }
+    }
+
+    /// Move selection down by a page
+    pub fn page_down(&mut self) {
+        let total = self.current_list_len();
+        if total > 0 {
+            let page_size = self.scroll_state.viewport_height.max(1);
+            self.selected_index = (self.selected_index + page_size).min(total - 1);
+            self.list_state.select(Some(self.selected_index));
+            self.scroll_state.ensure_visible(self.selected_index, total);
+        }
+    }
+
+    /// Move selection up by a page
+    pub fn page_up(&mut self) {
+        let total = self.current_list_len();
+        if total > 0 {
+            let page_size = self.scroll_state.viewport_height.max(1);
+            self.selected_index = self.selected_index.saturating_sub(page_size);
+            self.list_state.select(Some(self.selected_index));
+            self.scroll_state.ensure_visible(self.selected_index, total);
+        }
+    }
+
+    /// Jump to the first item
+    pub fn select_first(&mut self) {
+        let total = self.current_list_len();
+        if total > 0 {
+            self.selected_index = 0;
+            self.list_state.select(Some(0));
+            self.scroll_state.offset = 0;
+        }
+    }
+
+    /// Jump to the last item
+    pub fn select_last(&mut self) {
+        let total = self.current_list_len();
+        if total > 0 {
+            self.selected_index = total - 1;
+            self.list_state.select(Some(self.selected_index));
+            self.scroll_state.ensure_visible(self.selected_index, total);
+        }
+    }
+
+    /// Get the current list length (filtered or full)
+    fn current_list_len(&self) -> usize {
+        if !self.search_query.is_empty() {
+            self.filtered.len()
+        } else {
+            self.flattened.len()
         }
     }
 
@@ -418,6 +540,11 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                         KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                         KeyCode::Char('k') | KeyCode::Up => app.select_previous(),
                         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected(),
+                        // Page navigation for large trees
+                        KeyCode::PageDown | KeyCode::Char('d') => app.page_down(),
+                        KeyCode::PageUp | KeyCode::Char('u') => app.page_up(),
+                        KeyCode::Home | KeyCode::Char('g') => app.select_first(),
+                        KeyCode::End | KeyCode::Char('G') => app.select_last(),
                         _ => {}
                     }
                 }
@@ -513,28 +640,48 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(search_bar, area);
 }
 
-/// Render the dependency tree
+/// Render the dependency tree with virtual scrolling
+///
+/// Only renders visible nodes for performance with large trees (1000+ nodes).
+/// Updates the scroll state viewport height based on available area.
 pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     // Clone what we need to avoid borrowing issues
     let has_search = !app.search_query.is_empty();
     let search_query = app.search_query.clone();
 
-    // Get the nodes to display - clone to avoid borrow issues
-    let display_nodes: Vec<FlattenedNode> = if has_search {
-        app.filtered.clone()
+    // Get the nodes to display
+    let display_nodes: &[FlattenedNode] = if has_search {
+        &app.filtered
     } else {
-        app.flattened.clone()
+        &app.flattened
     };
 
-    let items: Vec<ListItem> = display_nodes
+    let total_nodes = display_nodes.len();
+
+    // Calculate viewport height (area height minus borders)
+    // Border takes 2 rows (top + bottom)
+    let viewport_height = (area.height as usize).saturating_sub(2);
+    app.scroll_state.set_viewport_height(viewport_height);
+
+    // Ensure selection is visible and get visible range
+    app.scroll_state.ensure_visible(app.selected_index, total_nodes);
+    let (start_idx, end_idx) = app.scroll_state.visible_range(app.selected_index, total_nodes);
+
+    // Only render visible nodes (virtual scrolling optimization)
+    let visible_nodes = &display_nodes[start_idx..end_idx];
+
+    let items: Vec<ListItem> = visible_nodes
         .iter()
         .enumerate()
-        .map(|(index, node)| {
+        .map(|(visible_idx, node)| {
+            // Calculate actual index in the full list
+            let actual_index = start_idx + visible_idx;
+
             // Only show tree prefix for non-filtered views
             let prefix = if has_search {
                 String::new()
             } else {
-                app.get_tree_prefix(index)
+                app.get_tree_prefix(actual_index)
             };
             let indicator = node.expansion_indicator();
             let base_dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle, node.has_conflict);
@@ -573,10 +720,23 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    // Adjust list_state selection to be relative to visible window
+    let relative_selection = app.selected_index.saturating_sub(start_idx);
+    app.list_state.select(Some(relative_selection));
+
+    // Build title with scroll position indicator for large trees
     let title = if has_search {
-        format!("Dependencies (filtered: {} matches)", display_nodes.len())
+        format!("Dependencies (filtered: {} matches)", total_nodes)
+    } else if total_nodes > viewport_height {
+        // Show scroll position for large trees
+        format!(
+            "Dependencies ({}-{} of {})",
+            start_idx + 1,
+            end_idx,
+            total_nodes
+        )
     } else {
-        "Dependencies".to_string()
+        format!("Dependencies ({})", total_nodes)
     };
 
     let tree_block = Block::default()
@@ -663,14 +823,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Cancel"),
         ])
     } else {
-        // Normal mode help with search shortcut
+        // Normal mode help with search shortcut and page navigation
         Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" Search  "),
-            Span::styled("j/↓", Style::default().fg(Color::Yellow)),
-            Span::raw(" Down  "),
-            Span::styled("k/↑", Style::default().fg(Color::Yellow)),
-            Span::raw(" Up  "),
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(" Nav  "),
+            Span::styled("d/u", Style::default().fg(Color::Yellow)),
+            Span::raw(" Page  "),
+            Span::styled("g/G", Style::default().fg(Color::Yellow)),
+            Span::raw(" Top/Bot  "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" Toggle  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -679,14 +841,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Prod  "),
             Span::styled("[D]", Style::default().fg(Color::Yellow)),
             Span::raw(" Dev  "),
-            Span::styled("[Pe]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Peer  "),
-            Span::styled("[O]", Style::default().fg(Color::Gray)),
-            Span::raw(" Opt  "),
             Span::styled("[!]", Style::default().fg(Color::Red)),
             Span::raw(" Cycle  "),
-            Span::styled("[~]", Style::default().fg(Color::Rgb(255, 165, 0))),
-            Span::raw(" Conflict  │  "),
             Span::styled("L#", Style::default().fg(Color::Rgb(100, 149, 237))),
             Span::raw(" Depth"),
         ])
@@ -924,5 +1080,104 @@ mod tests {
         assert_eq!(get_depth_indicator(1), "L1 ");
         assert_eq!(get_depth_indicator(5), "L5 ");
         assert_eq!(get_depth_indicator(10), "L10 ");
+    }
+
+    #[test]
+    fn test_virtual_scroll_state_new() {
+        let state = VirtualScrollState::new();
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.viewport_height, 0);
+    }
+
+    #[test]
+    fn test_virtual_scroll_visible_range() {
+        let mut state = VirtualScrollState::new();
+        state.set_viewport_height(10);
+
+        // At start
+        let (start, end) = state.visible_range(0, 100);
+        assert_eq!(start, 0);
+        assert_eq!(end, 10);
+
+        // Selection in middle (offset should adjust)
+        state.offset = 0;
+        let (start, end) = state.visible_range(50, 100);
+        assert!(start <= 50);
+        assert!(end > 50);
+
+        // At end
+        let (start, end) = state.visible_range(99, 100);
+        assert!(start >= 90);
+        assert_eq!(end, 100);
+
+        // Empty list
+        let (start, end) = state.visible_range(0, 0);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn test_virtual_scroll_ensure_visible() {
+        let mut state = VirtualScrollState::new();
+        state.set_viewport_height(10);
+        state.offset = 50;
+
+        // Selection above visible area - should scroll up
+        state.ensure_visible(40, 100);
+        assert_eq!(state.offset, 40);
+
+        // Selection below visible area - should scroll down
+        state.offset = 0;
+        state.ensure_visible(15, 100);
+        assert!(state.offset > 0);
+        assert!(state.offset + state.viewport_height > 15);
+    }
+
+    #[test]
+    fn test_page_navigation() {
+        let mut app = create_test_app();
+        app.scroll_state.set_viewport_height(2);
+
+        // Expand everything
+        app.tree.expanded = true;
+        for child in &mut app.tree.children {
+            child.expanded = true;
+        }
+        app.refresh_flattened();
+
+        // Page down
+        app.selected_index = 0;
+        app.page_down();
+        assert_eq!(app.selected_index, 2);
+
+        // Page up
+        app.page_up();
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_select_first_last() {
+        let mut app = create_test_app();
+
+        // Go to last
+        app.select_last();
+        assert_eq!(app.selected_index, app.flattened.len() - 1);
+
+        // Go to first
+        app.select_first();
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_current_list_len() {
+        let mut app = create_test_app();
+
+        // Without search
+        assert_eq!(app.current_list_len(), app.flattened.len());
+
+        // With search
+        app.start_search();
+        app.search_push('r');
+        assert_eq!(app.current_list_len(), app.filtered.len());
     }
 }

@@ -9,13 +9,9 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-pub mod graph;
-pub mod parser;
-mod ui;
-
-use graph::DependencyGraph;
-use parser::{extract_dependencies, parse_file, DependencyType};
-use ui::{run_app, App, TreeNode};
+use codescope::graph::{self, DependencyGraph};
+use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
+use codescope::ui::{run_app, App, TreeNode};
 
 #[derive(Parser)]
 #[command(name = "codescope")]

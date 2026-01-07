@@ -4,7 +4,7 @@
 //! dependency trees and interacting with the analysis results.
 
 mod app;
-mod tree;
+pub mod tree;
 
 pub use app::{run_app, App};
 pub use tree::TreeNode;
