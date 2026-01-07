@@ -269,6 +269,79 @@ fn get_dep_type_color(dep_type: Option<DependencyType>, is_in_cycle: bool, has_c
     }
 }
 
+/// Maximum depth for color gradient calculations
+const MAX_DEPTH_FOR_COLOR: usize = 10;
+
+/// Get color intensity based on depth (brighter = closer to root)
+///
+/// Returns a brightness factor from 0.0 to 1.0 where:
+/// - Depth 0 (root): 1.0 (brightest)
+/// - Max depth: 0.4 (dimmer but still visible)
+fn get_depth_brightness(depth: usize) -> f32 {
+    let clamped_depth = depth.min(MAX_DEPTH_FOR_COLOR);
+    let ratio = clamped_depth as f32 / MAX_DEPTH_FOR_COLOR as f32;
+    // Linear interpolation from 1.0 (bright) to 0.4 (dim)
+    1.0 - (ratio * 0.6)
+}
+
+/// Apply brightness modifier to a color based on depth
+///
+/// Adjusts the color brightness so deeper nodes appear dimmer,
+/// making the dependency chain depth immediately visible.
+fn apply_depth_color(base_color: Color, depth: usize) -> Color {
+    let brightness = get_depth_brightness(depth);
+
+    match base_color {
+        Color::Rgb(r, g, b) => {
+            Color::Rgb(
+                (r as f32 * brightness) as u8,
+                (g as f32 * brightness) as u8,
+                (b as f32 * brightness) as u8,
+            )
+        }
+        Color::Green => {
+            let base = 255_f32;
+            Color::Rgb(0, (base * brightness) as u8, 0)
+        }
+        Color::Yellow => {
+            let base = 255_f32;
+            Color::Rgb((base * brightness) as u8, (base * brightness) as u8, 0)
+        }
+        Color::Cyan => {
+            let base = 255_f32;
+            Color::Rgb(0, (base * brightness) as u8, (base * brightness) as u8)
+        }
+        Color::Red => {
+            let base = 255_f32;
+            Color::Rgb((base * brightness) as u8, 0, 0)
+        }
+        Color::Gray => {
+            let base = 128_f32;
+            let val = (base * brightness) as u8;
+            Color::Rgb(val, val, val)
+        }
+        Color::White => {
+            let base = 255_f32;
+            let val = (base * brightness) as u8;
+            Color::Rgb(val, val, val)
+        }
+        // For other color types, return as-is
+        other => other,
+    }
+}
+
+/// Get the depth indicator string for a node
+///
+/// Returns a depth level indicator that shows how deep in the
+/// dependency tree this node is located.
+fn get_depth_indicator(depth: usize) -> String {
+    if depth == 0 {
+        String::new() // Root node doesn't need depth indicator
+    } else {
+        format!("L{} ", depth)
+    }
+}
+
 /// Get the short type indicator for a dependency type
 ///
 /// Returns a short label for display next to the dependency name:
@@ -464,10 +537,13 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.get_tree_prefix(index)
             };
             let indicator = node.expansion_indicator();
-            let dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle, node.has_conflict);
+            let base_dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle, node.has_conflict);
+            // Apply depth-based color gradient (brighter = closer to root)
+            let dep_color = apply_depth_color(base_dep_color, node.depth);
             let type_indicator = get_dep_type_indicator(node.dep_type);
             let cycle_indicator = get_cycle_indicator(node.is_in_cycle);
             let conflict_indicator = get_conflict_indicator(node.has_conflict);
+            let depth_indicator = get_depth_indicator(node.depth);
 
             // Build the name with highlighting if there's a search query
             let name_spans = if has_search {
@@ -476,9 +552,13 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 vec![Span::styled(node.name.clone(), Style::default().fg(dep_color))]
             };
 
+            // Depth indicator color - blue gradient based on depth
+            let depth_color = apply_depth_color(Color::Rgb(100, 149, 237), node.depth); // Cornflower blue
+
             let mut content_spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(indicator, Style::default().fg(Color::Yellow)),
+                Span::styled(depth_indicator, Style::default().fg(depth_color)),
                 Span::styled(cycle_indicator, Style::default().fg(Color::Red)),
                 Span::styled(conflict_indicator, Style::default().fg(Color::Rgb(255, 165, 0))),
                 Span::styled(type_indicator, Style::default().fg(dep_color)),
@@ -606,7 +686,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[!]", Style::default().fg(Color::Red)),
             Span::raw(" Cycle  "),
             Span::styled("[~]", Style::default().fg(Color::Rgb(255, 165, 0))),
-            Span::raw(" Conflict"),
+            Span::raw(" Conflict  │  "),
+            Span::styled("L#", Style::default().fg(Color::Rgb(100, 149, 237))),
+            Span::raw(" Depth"),
         ])
     };
 
@@ -795,5 +877,52 @@ mod tests {
         // Pop on empty doesn't panic
         app.search_pop();
         assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn test_depth_brightness() {
+        // Root node should be brightest
+        assert!((get_depth_brightness(0) - 1.0).abs() < f32::EPSILON);
+
+        // Middle depth
+        let mid_brightness = get_depth_brightness(5);
+        assert!(mid_brightness > 0.4);
+        assert!(mid_brightness < 1.0);
+
+        // Max depth should be dimmest
+        let max_brightness = get_depth_brightness(MAX_DEPTH_FOR_COLOR);
+        assert!((max_brightness - 0.4).abs() < f32::EPSILON);
+
+        // Beyond max depth should clamp to dimmest
+        let beyond_max = get_depth_brightness(MAX_DEPTH_FOR_COLOR + 5);
+        assert!((beyond_max - 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_depth_color() {
+        // Root (depth 0) should preserve full brightness
+        let root_color = apply_depth_color(Color::Green, 0);
+        assert_eq!(root_color, Color::Rgb(0, 255, 0));
+
+        // Deeper nodes should be dimmer
+        let deep_color = apply_depth_color(Color::Green, MAX_DEPTH_FOR_COLOR);
+        match deep_color {
+            Color::Rgb(_, g, _) => {
+                assert!(g < 255);
+                assert!(g > 50); // Still visible
+            }
+            _ => panic!("Expected RGB color"),
+        }
+    }
+
+    #[test]
+    fn test_depth_indicator() {
+        // Root node has no depth indicator
+        assert_eq!(get_depth_indicator(0), "");
+
+        // Other depths show level
+        assert_eq!(get_depth_indicator(1), "L1 ");
+        assert_eq!(get_depth_indicator(5), "L5 ");
+        assert_eq!(get_depth_indicator(10), "L10 ");
     }
 }
