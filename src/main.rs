@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -10,6 +11,7 @@ use crossterm::{
 use ratatui::prelude::*;
 
 use codescope::bundle::savings::{SavingsCalculator, SavingsReport};
+use codescope::export::{export, ExportData, ExportFormat};
 use codescope::graph::{self, DependencyGraph};
 use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
 use codescope::ui::{run_app, App, TreeNode, format_size, SortMode};
@@ -61,6 +63,15 @@ enum Commands {
         /// Exit with code 1 if potential savings exceed this threshold
         #[arg(long, value_name = "KB")]
         savings_threshold: Option<u64>,
+
+        /// Export analysis results in the specified format (json, csv, markdown)
+        /// Requires --no-tui flag
+        #[arg(long, value_name = "FORMAT")]
+        export: Option<String>,
+
+        /// Output file path for export (defaults to stdout if not specified)
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<String>,
     },
     /// Show version information
     Version,
@@ -79,6 +90,8 @@ fn main() -> io::Result<()> {
             sort_by_size,
             savings_report,
             savings_threshold,
+            export: export_format,
+            output,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -162,6 +175,52 @@ fn main() -> io::Result<()> {
                             report.summary.format_total_savings(),
                             threshold_kb
                         );
+                    }
+                }
+                return Ok(());
+            }
+
+            // Handle --export flag
+            if let Some(format_str) = export_format {
+                if !*no_tui {
+                    eprintln!("❌ The --export flag requires --no-tui to be set.");
+                    eprintln!("   Usage: codescope analyze --no-tui --export json");
+                    std::process::exit(1);
+                }
+
+                // Parse the export format
+                let format: ExportFormat = match format_str.parse() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("❌ {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                // Create export data
+                let project_name = pkg.name.clone().unwrap_or_else(|| "project".to_string());
+                let project_version = pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string());
+                let export_data = ExportData::new(project_name, project_version, deps.clone(), &graph);
+
+                // Write to output (file or stdout)
+                if let Some(output_path) = output {
+                    let mut file = match File::create(output_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("❌ Failed to create output file '{}': {}", output_path, e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = export(format, &export_data, &mut file) {
+                        eprintln!("❌ Export failed: {}", e);
+                        std::process::exit(1);
+                    }
+                    eprintln!("✅ Exported {} format to: {}", format, output_path);
+                } else {
+                    let mut stdout = io::stdout();
+                    if let Err(e) = export(format, &export_data, &mut stdout) {
+                        eprintln!("❌ Export failed: {}", e);
+                        std::process::exit(1);
                     }
                 }
                 return Ok(());

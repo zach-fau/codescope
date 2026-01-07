@@ -5,6 +5,7 @@
 
 pub mod analysis;
 pub mod bundle;
+pub mod export;
 pub mod graph;
 pub mod parser;
 pub mod ui;
