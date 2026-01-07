@@ -1,0 +1,50 @@
+[package]
+name = "codescope"
+version = "0.1.0"
+edition = "2021"
+authors = ["Zachary Woods <143150513+zach-fau@users.noreply.github.com>"]
+description = "Terminal UI dependency analyzer with bundle size impact visualization"
+license = "MIT"
+repository = "https://github.com/zach-fau/codescope"
+keywords = ["cli", "dependencies", "tui", "bundle-analyzer", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# TUI Framework
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Parsing & Data Structures
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+petgraph = "0.6"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async Runtime (for future features)
+tokio = { version = "1.35", features = ["full"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bin]]
+name = "codescope"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[features]
+default = []
+watch-mode = ["tokio"]
