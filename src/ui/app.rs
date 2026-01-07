@@ -18,6 +18,38 @@ use ratatui::{
 use crate::parser::types::DependencyType;
 use super::tree::{FlattenedNode, TreeNode, format_size};
 
+/// Sort mode for the dependency tree
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Alphabetical sort by name (default, preserves tree structure)
+    #[default]
+    Alphabetical,
+    /// Sort by bundle size, largest first (flattened view)
+    SizeDescending,
+    /// Sort by bundle size, smallest first (flattened view)
+    SizeAscending,
+}
+
+impl SortMode {
+    /// Cycle to the next sort mode
+    pub fn cycle(&self) -> Self {
+        match self {
+            SortMode::Alphabetical => SortMode::SizeDescending,
+            SortMode::SizeDescending => SortMode::SizeAscending,
+            SortMode::SizeAscending => SortMode::Alphabetical,
+        }
+    }
+
+    /// Get a short display name for the sort mode
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SortMode::Alphabetical => "A-Z",
+            SortMode::SizeDescending => "Size ↓",
+            SortMode::SizeAscending => "Size ↑",
+        }
+    }
+}
+
 /// Virtual scroll state for efficient rendering of large trees
 #[derive(Debug, Default, Clone)]
 pub struct VirtualScrollState {
@@ -104,11 +136,18 @@ pub struct App {
     pub search_query: String,
     /// Virtual scroll state for performance with large trees
     pub scroll_state: VirtualScrollState,
+    /// Current sort mode for the dependency list
+    pub sort_mode: SortMode,
 }
 
 impl App {
     /// Create a new application with the given root tree node
     pub fn new(root: TreeNode) -> Self {
+        Self::with_sort_mode(root, SortMode::default())
+    }
+
+    /// Create a new application with the given root tree node and initial sort mode
+    pub fn with_sort_mode(root: TreeNode, sort_mode: SortMode) -> Self {
         let mut app = Self {
             tree: root,
             selected_index: 0,
@@ -120,6 +159,7 @@ impl App {
             search_active: false,
             search_query: String::new(),
             scroll_state: VirtualScrollState::new(),
+            sort_mode,
         };
         app.refresh_flattened();
         app.list_state.select(Some(0));
@@ -129,11 +169,69 @@ impl App {
     /// Refresh the flattened view from the tree
     pub fn refresh_flattened(&mut self) {
         self.flattened = self.tree.flatten();
+        self.apply_sort();
         self.rebuild_ancestors_last();
 
         // Ensure selected index is valid
         if !self.flattened.is_empty() && self.selected_index >= self.flattened.len() {
             self.selected_index = self.flattened.len() - 1;
+        }
+    }
+
+    /// Apply the current sort mode to the flattened view
+    ///
+    /// For size-based sorting, the view is flattened (tree structure is lost)
+    /// to allow proper comparison by bundle size. Nodes without bundle size
+    /// are placed at the end.
+    fn apply_sort(&mut self) {
+        match self.sort_mode {
+            SortMode::Alphabetical => {
+                // Alphabetical mode preserves tree structure (already sorted by tree traversal)
+                // No additional sorting needed
+            }
+            SortMode::SizeDescending => {
+                // Sort by size descending, nodes without size go last
+                self.flattened.sort_by(|a, b| {
+                    match (a.bundle_size, b.bundle_size) {
+                        (Some(size_a), Some(size_b)) => size_b.cmp(&size_a),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.name.cmp(&b.name),
+                    }
+                });
+            }
+            SortMode::SizeAscending => {
+                // Sort by size ascending, nodes without size go last
+                self.flattened.sort_by(|a, b| {
+                    match (a.bundle_size, b.bundle_size) {
+                        (Some(size_a), Some(size_b)) => size_a.cmp(&size_b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.name.cmp(&b.name),
+                    }
+                });
+            }
+        }
+    }
+
+    /// Cycle to the next sort mode and refresh the view
+    pub fn cycle_sort_mode(&mut self) {
+        self.sort_mode = self.sort_mode.cycle();
+        self.refresh_flattened();
+        // Reset selection to top when changing sort mode
+        self.selected_index = 0;
+        self.list_state.select(Some(0));
+        self.scroll_state.offset = 0;
+    }
+
+    /// Set the sort mode and refresh the view
+    pub fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode != mode {
+            self.sort_mode = mode;
+            self.refresh_flattened();
+            self.selected_index = 0;
+            self.list_state.select(Some(0));
+            self.scroll_state.offset = 0;
         }
     }
 
@@ -583,6 +681,8 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Res
                         KeyCode::PageUp | KeyCode::Char('u') => app.page_up(),
                         KeyCode::Home | KeyCode::Char('g') => app.select_first(),
                         KeyCode::End | KeyCode::Char('G') => app.select_last(),
+                        // Sort mode toggle
+                        KeyCode::Char('s') => app.cycle_sort_mode(),
                         _ => {}
                     }
                 }
@@ -874,18 +974,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Cancel"),
         ])
     } else {
-        // Normal mode help with search shortcut and page navigation
+        // Normal mode help with search shortcut, sort mode, and page navigation
         Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" Search  "),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(" Sort  "),
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::raw(" Nav  "),
             Span::styled("d/u", Style::default().fg(Color::Yellow)),
             Span::raw(" Page  "),
-            Span::styled("g/G", Style::default().fg(Color::Yellow)),
-            Span::raw(" Top/Bot  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" Toggle  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" Quit  │  "),
             Span::styled("[P]", Style::default().fg(Color::Green)),
@@ -893,14 +991,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[D]", Style::default().fg(Color::Yellow)),
             Span::raw(" Dev  "),
             Span::styled("[!]", Style::default().fg(Color::Red)),
-            Span::raw(" Cycle  "),
-            Span::styled("L#", Style::default().fg(Color::Rgb(100, 149, 237))),
-            Span::raw(" Depth  │  Size: "),
-            Span::styled(">500K", Style::default().fg(Color::Red)),
-            Span::raw(" "),
-            Span::styled("100-500K", Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
-            Span::styled("<100K", Style::default().fg(Color::Green)),
+            Span::raw(" Cycle  │  Sort: "),
+            Span::styled(app.sort_mode.display_name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ])
     };
 
@@ -1354,5 +1446,223 @@ mod tests {
         // Verify threshold constants
         assert_eq!(SIZE_LARGE_THRESHOLD, 500 * 1024);
         assert_eq!(SIZE_MEDIUM_THRESHOLD, 100 * 1024);
+    }
+
+    // Sort mode tests
+
+    #[test]
+    fn test_sort_mode_cycle() {
+        // Alphabetical -> SizeDescending -> SizeAscending -> Alphabetical
+        let mode = SortMode::Alphabetical;
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::SizeDescending);
+
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::SizeAscending);
+
+        let mode = mode.cycle();
+        assert_eq!(mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_sort_mode_display_name() {
+        assert_eq!(SortMode::Alphabetical.display_name(), "A-Z");
+        assert_eq!(SortMode::SizeDescending.display_name(), "Size ↓");
+        assert_eq!(SortMode::SizeAscending.display_name(), "Size ↑");
+    }
+
+    #[test]
+    fn test_sort_mode_default() {
+        let mode = SortMode::default();
+        assert_eq!(mode, SortMode::Alphabetical);
+    }
+
+    fn create_test_app_with_sizes() -> App {
+        let mut root = TreeNode::new("my-project".to_string(), "1.0.0".to_string());
+
+        let mut dep_a = TreeNode::new("alpha".to_string(), "1.0.0".to_string());
+        dep_a.bundle_size = Some(50000); // 50KB
+
+        let mut dep_b = TreeNode::new("beta".to_string(), "2.0.0".to_string());
+        dep_b.bundle_size = Some(100000); // 100KB
+
+        let mut dep_c = TreeNode::new("gamma".to_string(), "3.0.0".to_string());
+        dep_c.bundle_size = Some(25000); // 25KB
+
+        // delta has no size
+        let dep_d = TreeNode::new("delta".to_string(), "4.0.0".to_string());
+
+        root.add_child(dep_a);
+        root.add_child(dep_b);
+        root.add_child(dep_c);
+        root.add_child(dep_d);
+        root.expanded = true;
+
+        App::new(root)
+    }
+
+    #[test]
+    fn test_app_default_sort_mode() {
+        let app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_app_with_sort_mode() {
+        let root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let app = App::with_sort_mode(root, SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+    }
+
+    #[test]
+    fn test_cycle_sort_mode() {
+        let mut app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeAscending);
+
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+    }
+
+    #[test]
+    fn test_set_sort_mode() {
+        let mut app = create_test_app();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        app.set_sort_mode(SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Setting same mode should be a no-op
+        app.set_sort_mode(SortMode::SizeDescending);
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+    }
+
+    #[test]
+    fn test_sort_by_size_descending() {
+        let mut app = create_test_app_with_sizes();
+
+        // Default is alphabetical - check initial state
+        // (root + 4 children when expanded)
+        assert_eq!(app.flattened.len(), 5);
+
+        // Cycle to size descending
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Nodes with sizes should be sorted largest first
+        // Order should be: beta (100KB) > alpha (50KB) > gamma (25KB) > delta (no size) > my-project (no size)
+
+        // First nodes should have size, last should not (or be smallest)
+        // Verify that nodes with sizes come before nodes without sizes
+        let mut found_no_size = false;
+        for node in &app.flattened {
+            if node.bundle_size.is_none() {
+                found_no_size = true;
+            } else if found_no_size {
+                panic!("Node with size found after node without size in descending sort");
+            }
+        }
+
+        // Verify descending order for nodes that have sizes
+        let sizes_only: Vec<u64> = app.flattened.iter()
+            .filter_map(|n| n.bundle_size)
+            .collect();
+        for i in 1..sizes_only.len() {
+            assert!(sizes_only[i-1] >= sizes_only[i], "Sizes should be in descending order");
+        }
+    }
+
+    #[test]
+    fn test_sort_by_size_ascending() {
+        let mut app = create_test_app_with_sizes();
+
+        // Cycle twice to get to size ascending
+        app.cycle_sort_mode(); // -> SizeDescending
+        app.cycle_sort_mode(); // -> SizeAscending
+        assert_eq!(app.sort_mode, SortMode::SizeAscending);
+
+        // Verify ascending order for nodes that have sizes
+        let sizes_only: Vec<u64> = app.flattened.iter()
+            .filter_map(|n| n.bundle_size)
+            .collect();
+        for i in 1..sizes_only.len() {
+            assert!(sizes_only[i-1] <= sizes_only[i], "Sizes should be in ascending order");
+        }
+    }
+
+    #[test]
+    fn test_sort_alphabetical_preserves_tree() {
+        let mut app = create_test_app_with_sizes();
+        assert_eq!(app.sort_mode, SortMode::Alphabetical);
+
+        // In alphabetical mode, tree structure should be preserved
+        // Root should come first, then children in order they were added
+        assert_eq!(app.flattened[0].name, "my-project");
+
+        // Cycle through all modes and back to alphabetical
+        app.cycle_sort_mode(); // -> SizeDescending
+        app.cycle_sort_mode(); // -> SizeAscending
+        app.cycle_sort_mode(); // -> Alphabetical
+
+        // Tree structure should be restored
+        assert_eq!(app.flattened[0].name, "my-project");
+    }
+
+    #[test]
+    fn test_cycle_sort_mode_resets_selection() {
+        let mut app = create_test_app_with_sizes();
+
+        // Move selection
+        app.select_next();
+        app.select_next();
+        assert!(app.selected_index > 0);
+
+        // Cycle sort mode
+        app.cycle_sort_mode();
+
+        // Selection should be reset to top
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_sort_with_all_no_size() {
+        // Create app with no bundle sizes
+        let mut app = create_test_app();
+
+        // Cycle to size descending - should still work
+        app.cycle_sort_mode();
+        assert_eq!(app.sort_mode, SortMode::SizeDescending);
+
+        // Should fall back to alphabetical when no sizes
+        // (nodes without size are sorted by name)
+        assert!(!app.flattened.is_empty());
+    }
+
+    #[test]
+    fn test_sort_with_mixed_sizes() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+
+        let mut dep_with_size = TreeNode::new("with-size".to_string(), "1.0.0".to_string());
+        dep_with_size.bundle_size = Some(1000);
+
+        let dep_without_size = TreeNode::new("no-size".to_string(), "1.0.0".to_string());
+
+        root.add_child(dep_with_size);
+        root.add_child(dep_without_size);
+        root.expanded = true;
+
+        let app = App::with_sort_mode(root, SortMode::SizeDescending);
+
+        // Nodes with sizes should come before nodes without
+        let first_with_size = app.flattened.iter().position(|n| n.bundle_size.is_some()).unwrap();
+        let first_without_size = app.flattened.iter().position(|n| n.bundle_size.is_none()).unwrap();
+
+        assert!(first_with_size < first_without_size,
+            "Nodes with sizes should come before nodes without in size sort");
     }
 }

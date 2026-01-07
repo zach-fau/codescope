@@ -11,7 +11,7 @@ use ratatui::prelude::*;
 
 use codescope::graph::{self, DependencyGraph};
 use codescope::parser::{self, extract_dependencies, parse_file, DependencyType};
-use codescope::ui::{run_app, App, TreeNode, format_size};
+use codescope::ui::{run_app, App, TreeNode, format_size, SortMode};
 
 #[derive(Parser)]
 #[command(name = "codescope")]
@@ -46,6 +46,10 @@ enum Commands {
         /// Check for version conflicts (for CI usage, exits with code 1 if found)
         #[arg(long)]
         check_conflicts: bool,
+
+        /// Sort dependencies by bundle size (largest first) instead of alphabetically
+        #[arg(long)]
+        sort_by_size: bool,
     },
     /// Show version information
     Version,
@@ -61,6 +65,7 @@ fn main() -> io::Result<()> {
             no_tui,
             check_cycles,
             check_conflicts,
+            sort_by_size,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -148,8 +153,13 @@ fn main() -> io::Result<()> {
             let backend = CrosstermBackend::new(stdout);
             let mut terminal = Terminal::new(backend)?;
 
-            // Create app and run
-            let mut app = App::new(tree);
+            // Create app and run with appropriate sort mode
+            let initial_sort_mode = if *sort_by_size {
+                SortMode::SizeDescending
+            } else {
+                SortMode::Alphabetical
+            };
+            let mut app = App::with_sort_mode(tree, initial_sort_mode);
             let result = run_app(&mut terminal, &mut app);
 
             // Restore terminal

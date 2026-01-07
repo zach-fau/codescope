@@ -6,5 +6,5 @@
 mod app;
 pub mod tree;
 
-pub use app::{run_app, App};
+pub use app::{run_app, App, SortMode};
 pub use tree::{TreeNode, format_size};
