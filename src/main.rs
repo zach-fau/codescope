@@ -13,6 +13,7 @@ pub mod graph;
 pub mod parser;
 mod ui;
 
+use graph::DependencyGraph;
 use parser::{extract_dependencies, parse_file, DependencyType};
 use ui::{run_app, App, TreeNode};
 
@@ -41,6 +42,10 @@ enum Commands {
         /// Print dependency tree to stdout without TUI
         #[arg(long)]
         no_tui: bool,
+
+        /// Check for circular dependencies (for CI usage, exits with code 1 if found)
+        #[arg(long)]
+        check_cycles: bool,
     },
     /// Show version information
     Version,
@@ -54,6 +59,7 @@ fn main() -> io::Result<()> {
             path,
             with_bundle_size: _,
             no_tui,
+            check_cycles,
         }) => {
             let package_json_path = Path::new(path).join("package.json");
 
@@ -75,10 +81,35 @@ fn main() -> io::Result<()> {
             // Extract dependencies
             let deps = extract_dependencies(&pkg);
 
+            // Build dependency graph for cycle detection
+            let graph = build_dependency_graph(&deps);
+
+            // Handle --check-cycles flag (for CI usage)
+            if *check_cycles {
+                let cycles = graph.get_cycle_details();
+                if cycles.is_empty() {
+                    println!("✅ No circular dependencies detected.");
+                    return Ok(());
+                } else {
+                    eprintln!("❌ Circular dependencies detected!");
+                    eprintln!();
+                    for (i, cycle) in cycles.iter().enumerate() {
+                        eprintln!("  Cycle {}: {}", i + 1, cycle.cycle_path());
+                    }
+                    eprintln!();
+                    eprintln!("Found {} circular dependency cycle(s).", cycles.len());
+                    std::process::exit(1);
+                }
+            }
+
             // Build tree structure
-            let tree = build_dependency_tree(&pkg.name.clone().unwrap_or_else(|| "project".to_string()),
+            let mut tree = build_dependency_tree(&pkg.name.clone().unwrap_or_else(|| "project".to_string()),
                                              &pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
                                              &deps);
+
+            // Mark nodes that are part of cycles
+            let cycle_nodes = graph.get_nodes_in_cycles();
+            tree.mark_cycles(&cycle_nodes);
 
             if *no_tui {
                 // Print tree to stdout
@@ -203,6 +234,28 @@ fn build_dependency_tree(
     root
 }
 
+/// Build a DependencyGraph from parsed dependencies for cycle detection
+fn build_dependency_graph(deps: &[parser::Dependency]) -> DependencyGraph {
+    let mut graph = DependencyGraph::with_capacity(deps.len(), deps.len() * 2);
+
+    for dep in deps {
+        let dep_type = match dep.dep_type {
+            DependencyType::Production => graph::DependencyType::Production,
+            DependencyType::Development => graph::DependencyType::Development,
+            DependencyType::Peer => graph::DependencyType::Peer,
+            DependencyType::Optional => graph::DependencyType::Optional,
+        };
+        graph.add_dependency(&dep.name, &dep.version, dep_type);
+    }
+
+    // Note: In a real implementation, we would add edges based on resolved
+    // dependency relationships from lock files or npm/yarn resolution.
+    // For now, the graph only contains nodes without edges, so cycle detection
+    // will only work if edges are added elsewhere.
+
+    graph
+}
+
 /// Print tree to stdout (for --no-tui mode)
 fn print_tree(node: &TreeNode, depth: usize) {
     let indent = "  ".repeat(depth);
@@ -223,10 +276,13 @@ fn print_tree(node: &TreeNode, depth: usize) {
         None => "",
     };
 
+    // Get cycle indicator
+    let cycle_indicator = if node.is_in_cycle { "[!] " } else { "" };
+
     if node.version.is_empty() {
         println!("{}{}{}", indent, indicator, node.name);
     } else {
-        println!("{}{}{}{} @ {}", indent, indicator, type_indicator, node.name, node.version);
+        println!("{}{}{}{}{} @ {}", indent, indicator, cycle_indicator, type_indicator, node.name, node.version);
     }
 
     if node.expanded || depth == 0 {

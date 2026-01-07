@@ -4,6 +4,7 @@
 //! for rendering the tree as a scrollable list in the TUI.
 
 use crate::parser::types::DependencyType;
+use std::collections::HashSet;
 
 /// A node in the dependency tree
 #[derive(Debug, Clone)]
@@ -20,6 +21,8 @@ pub struct TreeNode {
     pub depth: usize,
     /// The type of dependency (Production, Development, Peer, Optional)
     pub dep_type: Option<DependencyType>,
+    /// Whether this node is part of a circular dependency
+    pub is_in_cycle: bool,
 }
 
 impl TreeNode {
@@ -32,6 +35,7 @@ impl TreeNode {
             expanded: false,
             depth: 0,
             dep_type: None,
+            is_in_cycle: false,
         }
     }
 
@@ -45,6 +49,7 @@ impl TreeNode {
             expanded: false,
             depth,
             dep_type: None,
+            is_in_cycle: false,
         }
     }
 
@@ -57,6 +62,18 @@ impl TreeNode {
             expanded: false,
             depth: 0,
             dep_type: Some(dep_type),
+            is_in_cycle: false,
+        }
+    }
+
+    /// Mark nodes that are part of cycles based on a set of cycle node names.
+    ///
+    /// This method recursively marks all nodes in the tree that match
+    /// names in the provided set.
+    pub fn mark_cycles(&mut self, cycle_nodes: &HashSet<String>) {
+        self.is_in_cycle = cycle_nodes.contains(&self.name);
+        for child in &mut self.children {
+            child.mark_cycles(cycle_nodes);
         }
     }
 
@@ -96,6 +113,7 @@ impl TreeNode {
             has_children: self.has_children(),
             is_last_child: is_last,
             dep_type: self.dep_type,
+            is_in_cycle: self.is_in_cycle,
         });
 
         if self.expanded {
@@ -154,6 +172,8 @@ pub struct FlattenedNode {
     pub is_last_child: bool,
     /// The type of dependency (Production, Development, Peer, Optional)
     pub dep_type: Option<DependencyType>,
+    /// Whether this node is part of a circular dependency
+    pub is_in_cycle: bool,
 }
 
 impl FlattenedNode {
@@ -293,6 +313,7 @@ mod tests {
             has_children: true,
             is_last_child: false,
             dep_type: None,
+            is_in_cycle: false,
         };
         assert_eq!(node_with_children.expansion_indicator(), "▶ ");
 
@@ -318,5 +339,47 @@ mod tests {
         );
         assert_eq!(node.name, "react");
         assert_eq!(node.dep_type, Some(DependencyType::Production));
+    }
+
+    #[test]
+    fn test_mark_cycles() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let dep_a = TreeNode::new("dep-a".to_string(), "1.0.0".to_string());
+        let dep_b = TreeNode::new("dep-b".to_string(), "1.0.0".to_string());
+        let dep_c = TreeNode::new("dep-c".to_string(), "1.0.0".to_string());
+
+        root.add_child(dep_a);
+        root.add_child(dep_b);
+        root.add_child(dep_c);
+
+        // Mark dep-a and dep-b as being in a cycle
+        let mut cycle_nodes = HashSet::new();
+        cycle_nodes.insert("dep-a".to_string());
+        cycle_nodes.insert("dep-b".to_string());
+
+        root.mark_cycles(&cycle_nodes);
+
+        assert!(!root.is_in_cycle);
+        assert!(root.children[0].is_in_cycle); // dep-a
+        assert!(root.children[1].is_in_cycle); // dep-b
+        assert!(!root.children[2].is_in_cycle); // dep-c
+    }
+
+    #[test]
+    fn test_flatten_includes_cycle_info() {
+        let mut root = TreeNode::new("project".to_string(), "1.0.0".to_string());
+        let dep_a = TreeNode::new("dep-a".to_string(), "1.0.0".to_string());
+        root.add_child(dep_a);
+
+        let mut cycle_nodes = HashSet::new();
+        cycle_nodes.insert("dep-a".to_string());
+
+        root.mark_cycles(&cycle_nodes);
+        root.expanded = true;
+
+        let flattened = root.flatten();
+        assert_eq!(flattened.len(), 2);
+        assert!(!flattened[0].is_in_cycle); // project
+        assert!(flattened[1].is_in_cycle); // dep-a
     }
 }

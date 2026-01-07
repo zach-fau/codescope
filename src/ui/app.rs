@@ -242,14 +242,19 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
     query_chars.peek().is_none()
 }
 
-/// Get the color for a dependency type
+/// Get the color for a dependency type, with cycle override
 ///
 /// Returns the appropriate color based on the dependency category:
+/// - Cycle nodes: Red (circular dependency warning)
 /// - Production: Green (bundled with the application)
 /// - Development: Yellow (only needed during development)
 /// - Peer: Cyan (expected to be provided by the consumer)
 /// - Optional: Gray (enhance functionality if available)
-fn get_dep_type_color(dep_type: Option<DependencyType>) -> Color {
+fn get_dep_type_color(dep_type: Option<DependencyType>, is_in_cycle: bool) -> Color {
+    // Cycle nodes are always shown in red regardless of dependency type
+    if is_in_cycle {
+        return Color::Red;
+    }
     match dep_type {
         Some(DependencyType::Production) => Color::Green,
         Some(DependencyType::Development) => Color::Yellow,
@@ -273,6 +278,17 @@ fn get_dep_type_indicator(dep_type: Option<DependencyType>) -> &'static str {
         Some(DependencyType::Peer) => "[Pe] ",
         Some(DependencyType::Optional) => "[O] ",
         None => "", // Root node or unknown type
+    }
+}
+
+/// Get the cycle indicator if the node is part of a circular dependency
+///
+/// Returns a warning symbol for nodes in cycles
+fn get_cycle_indicator(is_in_cycle: bool) -> &'static str {
+    if is_in_cycle {
+        "[!] "
+    } else {
+        ""
     }
 }
 
@@ -432,8 +448,9 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.get_tree_prefix(index)
             };
             let indicator = node.expansion_indicator();
-            let dep_color = get_dep_type_color(node.dep_type);
+            let dep_color = get_dep_type_color(node.dep_type, node.is_in_cycle);
             let type_indicator = get_dep_type_indicator(node.dep_type);
+            let cycle_indicator = get_cycle_indicator(node.is_in_cycle);
 
             // Build the name with highlighting if there's a search query
             let name_spans = if has_search {
@@ -445,6 +462,7 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut content_spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(indicator, Style::default().fg(Color::Yellow)),
+                Span::styled(cycle_indicator, Style::default().fg(Color::Red)),
                 Span::styled(type_indicator, Style::default().fg(dep_color)),
             ];
             content_spans.extend(name_spans);
@@ -566,7 +584,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("[Pe]", Style::default().fg(Color::Cyan)),
             Span::raw(" Peer  "),
             Span::styled("[O]", Style::default().fg(Color::Gray)),
-            Span::raw(" Opt"),
+            Span::raw(" Opt  "),
+            Span::styled("[!]", Style::default().fg(Color::Red)),
+            Span::raw(" Cycle"),
         ])
     };
 

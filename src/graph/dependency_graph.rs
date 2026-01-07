@@ -7,7 +7,7 @@ use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Represents the type of dependency relationship.
 ///
@@ -523,6 +523,64 @@ impl DependencyGraph {
         cycles
     }
 
+    /// Returns a set of package names that are part of any cycle.
+    ///
+    /// This is useful for marking nodes in the UI that participate in
+    /// circular dependencies.
+    ///
+    /// # Returns
+    ///
+    /// A `HashSet` of package names that are part of at least one cycle.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use codescope::graph::{DependencyGraph, DependencyType};
+    ///
+    /// let mut graph = DependencyGraph::new();
+    /// graph.add_dependency("a", "1.0.0", DependencyType::Production);
+    /// graph.add_dependency("b", "1.0.0", DependencyType::Production);
+    /// graph.add_dependency("c", "1.0.0", DependencyType::Production);
+    /// graph.add_dependency("d", "1.0.0", DependencyType::Production);
+    /// graph.add_edge("a", "b");
+    /// graph.add_edge("b", "c");
+    /// graph.add_edge("c", "a"); // Creates cycle: a -> b -> c -> a
+    /// graph.add_edge("a", "d"); // d is not part of the cycle
+    ///
+    /// let cycle_nodes = graph.get_nodes_in_cycles();
+    /// assert!(cycle_nodes.contains("a"));
+    /// assert!(cycle_nodes.contains("b"));
+    /// assert!(cycle_nodes.contains("c"));
+    /// assert!(!cycle_nodes.contains("d"));
+    /// ```
+    pub fn get_nodes_in_cycles(&self) -> HashSet<String> {
+        let cycles = self.detect_cycles();
+        let mut cycle_nodes = HashSet::new();
+
+        for cycle in cycles {
+            for node_name in cycle {
+                cycle_nodes.insert(node_name);
+            }
+        }
+
+        cycle_nodes
+    }
+
+    /// Returns detailed cycle information including the cycle path.
+    ///
+    /// For each cycle detected, returns the list of package names in the order
+    /// they form the cycle (note: the last element connects back to the first).
+    ///
+    /// # Returns
+    ///
+    /// A vector of `CycleInfo` structs containing cycle details.
+    pub fn get_cycle_details(&self) -> Vec<CycleInfo> {
+        self.detect_cycles()
+            .into_iter()
+            .map(|nodes| CycleInfo { nodes })
+            .collect()
+    }
+
     /// Returns the number of nodes in the graph.
     ///
     /// # Example
@@ -614,6 +672,42 @@ pub struct Dependency {
     pub version: String,
     /// Type of dependency
     pub dep_type: DependencyType,
+}
+
+/// Information about a detected circular dependency cycle.
+///
+/// Contains the list of package names that form the cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleInfo {
+    /// The package names in the cycle (the last connects back to the first)
+    pub nodes: Vec<String>,
+}
+
+impl CycleInfo {
+    /// Returns a formatted string representation of the cycle path.
+    ///
+    /// For example: "a -> b -> c -> a"
+    pub fn cycle_path(&self) -> String {
+        if self.nodes.is_empty() {
+            return String::new();
+        }
+        let mut path = self.nodes.join(" -> ");
+        if !self.nodes.is_empty() {
+            path.push_str(" -> ");
+            path.push_str(&self.nodes[0]);
+        }
+        path
+    }
+
+    /// Returns the number of packages in the cycle.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns true if the cycle is empty (should not happen in practice).
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
 }
 
 impl Dependency {
@@ -900,5 +994,98 @@ mod tests {
     fn test_default_dependency_type() {
         let default = DependencyType::default();
         assert_eq!(default, DependencyType::Production);
+    }
+
+    #[test]
+    fn test_get_nodes_in_cycles() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("a", "1.0.0", DependencyType::Production);
+        graph.add_dependency("b", "1.0.0", DependencyType::Production);
+        graph.add_dependency("c", "1.0.0", DependencyType::Production);
+        graph.add_dependency("d", "1.0.0", DependencyType::Production);
+
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "c");
+        graph.add_edge("c", "a"); // Creates cycle: a -> b -> c -> a
+        graph.add_edge("a", "d"); // d is not part of the cycle
+
+        let cycle_nodes = graph.get_nodes_in_cycles();
+        assert!(cycle_nodes.contains("a"));
+        assert!(cycle_nodes.contains("b"));
+        assert!(cycle_nodes.contains("c"));
+        assert!(!cycle_nodes.contains("d")); // d is not in the cycle
+        assert_eq!(cycle_nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_get_nodes_in_cycles_no_cycles() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("a", "1.0.0", DependencyType::Production);
+        graph.add_dependency("b", "1.0.0", DependencyType::Production);
+        graph.add_dependency("c", "1.0.0", DependencyType::Production);
+
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "c");
+
+        let cycle_nodes = graph.get_nodes_in_cycles();
+        assert!(cycle_nodes.is_empty());
+    }
+
+    #[test]
+    fn test_get_cycle_details() {
+        let mut graph = DependencyGraph::new();
+        graph.add_dependency("a", "1.0.0", DependencyType::Production);
+        graph.add_dependency("b", "1.0.0", DependencyType::Production);
+        graph.add_dependency("c", "1.0.0", DependencyType::Production);
+
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "c");
+        graph.add_edge("c", "a"); // Creates cycle
+
+        let cycle_details = graph.get_cycle_details();
+        assert_eq!(cycle_details.len(), 1);
+        assert_eq!(cycle_details[0].len(), 3);
+    }
+
+    #[test]
+    fn test_cycle_info_cycle_path() {
+        let cycle = CycleInfo {
+            nodes: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        };
+        assert_eq!(cycle.cycle_path(), "a -> b -> c -> a");
+    }
+
+    #[test]
+    fn test_cycle_info_empty() {
+        let cycle = CycleInfo { nodes: vec![] };
+        assert!(cycle.is_empty());
+        assert_eq!(cycle.len(), 0);
+        assert_eq!(cycle.cycle_path(), "");
+    }
+
+    #[test]
+    fn test_multiple_cycles() {
+        let mut graph = DependencyGraph::new();
+        // First cycle: a -> b -> a
+        graph.add_dependency("a", "1.0.0", DependencyType::Production);
+        graph.add_dependency("b", "1.0.0", DependencyType::Production);
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "a");
+
+        // Second cycle: c -> d -> e -> c
+        graph.add_dependency("c", "1.0.0", DependencyType::Production);
+        graph.add_dependency("d", "1.0.0", DependencyType::Production);
+        graph.add_dependency("e", "1.0.0", DependencyType::Production);
+        graph.add_edge("c", "d");
+        graph.add_edge("d", "e");
+        graph.add_edge("e", "c");
+
+        let cycle_nodes = graph.get_nodes_in_cycles();
+        assert_eq!(cycle_nodes.len(), 5);
+        assert!(cycle_nodes.contains("a"));
+        assert!(cycle_nodes.contains("b"));
+        assert!(cycle_nodes.contains("c"));
+        assert!(cycle_nodes.contains("d"));
+        assert!(cycle_nodes.contains("e"));
     }
 }
