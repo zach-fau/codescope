@@ -4,8 +4,21 @@
 
 ## 🎯 Quick Start for Any Session
 
+### What to Say to New Agent
+
+**Copy-paste this to start a new session:**
+
+```
+I'm working on CodeScope, a Rust terminal dependency analyzer.
+Read /home/gyatso/Development/codescope/.claude/CLAUDE.md first,
+then check NEXT_STEPS.md and current GitHub issues. Let's continue
+development from where we left off.
+```
+
+### Then the Agent Will:
+
 ```bash
-# 1. Always start here
+# 1. Read the workflow guide
 cat /home/gyatso/Development/codescope/.claude/CLAUDE.md  # This file
 
 # 2. Check what's next
