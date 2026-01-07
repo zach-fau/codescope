@@ -7,4 +7,4 @@ mod app;
 mod tree;
 
 pub use app::{run_app, App};
-pub use tree::{FlattenedNode, TreeNode};
+pub use tree::TreeNode;

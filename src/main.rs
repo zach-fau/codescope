@@ -144,7 +144,8 @@ fn build_dependency_tree(
     let mut optional_deps: Vec<TreeNode> = Vec::new();
 
     for dep in deps {
-        let node = TreeNode::new(dep.name.clone(), dep.version.clone());
+        // Create node with dependency type for color coding
+        let node = TreeNode::with_dep_type(dep.name.clone(), dep.version.clone(), dep.dep_type);
         match dep.dep_type {
             DependencyType::Production => prod_deps.push(node),
             DependencyType::Development => dev_deps.push(node),
@@ -213,10 +214,19 @@ fn print_tree(node: &TreeNode, depth: usize) {
         "▶ "
     };
 
+    // Get type indicator for the dependency
+    let type_indicator = match node.dep_type {
+        Some(DependencyType::Production) => "[P] ",
+        Some(DependencyType::Development) => "[D] ",
+        Some(DependencyType::Peer) => "[Pe] ",
+        Some(DependencyType::Optional) => "[O] ",
+        None => "",
+    };
+
     if node.version.is_empty() {
         println!("{}{}{}", indent, indicator, node.name);
     } else {
-        println!("{}{}{} @ {}", indent, indicator, node.name, node.version);
+        println!("{}{}{}{} @ {}", indent, indicator, type_indicator, node.name, node.version);
     }
 
     if node.expanded || depth == 0 {

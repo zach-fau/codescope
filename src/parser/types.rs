@@ -52,19 +52,19 @@ pub struct PackageJson {
 impl PackageJson {
     /// Returns true if the package has any dependencies defined.
     pub fn has_dependencies(&self) -> bool {
-        self.dependencies.as_ref().map_or(false, |d| !d.is_empty())
+        self.dependencies.as_ref().is_some_and(|d| !d.is_empty())
             || self
                 .dev_dependencies
                 .as_ref()
-                .map_or(false, |d| !d.is_empty())
+                .is_some_and(|d| !d.is_empty())
             || self
                 .peer_dependencies
                 .as_ref()
-                .map_or(false, |d| !d.is_empty())
+                .is_some_and(|d| !d.is_empty())
             || self
                 .optional_dependencies
                 .as_ref()
-                .map_or(false, |d| !d.is_empty())
+                .is_some_and(|d| !d.is_empty())
     }
 
     /// Returns the total count of all dependencies.

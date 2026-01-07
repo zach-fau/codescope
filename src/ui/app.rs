@@ -15,6 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::parser::types::DependencyType;
 use super::tree::{FlattenedNode, TreeNode};
 
 /// Application state
@@ -158,6 +159,40 @@ impl App {
     }
 }
 
+/// Get the color for a dependency type
+///
+/// Returns the appropriate color based on the dependency category:
+/// - Production: Green (bundled with the application)
+/// - Development: Yellow (only needed during development)
+/// - Peer: Cyan (expected to be provided by the consumer)
+/// - Optional: Gray (enhance functionality if available)
+fn get_dep_type_color(dep_type: Option<DependencyType>) -> Color {
+    match dep_type {
+        Some(DependencyType::Production) => Color::Green,
+        Some(DependencyType::Development) => Color::Yellow,
+        Some(DependencyType::Peer) => Color::Cyan,
+        Some(DependencyType::Optional) => Color::Gray,
+        None => Color::White, // Root node or unknown type
+    }
+}
+
+/// Get the short type indicator for a dependency type
+///
+/// Returns a short label for display next to the dependency name:
+/// - P: Production
+/// - D: Development
+/// - Pe: Peer
+/// - O: Optional
+fn get_dep_type_indicator(dep_type: Option<DependencyType>) -> &'static str {
+    match dep_type {
+        Some(DependencyType::Production) => "[P] ",
+        Some(DependencyType::Development) => "[D] ",
+        Some(DependencyType::Peer) => "[Pe] ",
+        Some(DependencyType::Optional) => "[O] ",
+        None => "", // Root node or unknown type
+    }
+}
+
 /// Run the TUI application
 pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
@@ -218,11 +253,14 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(index, node)| {
             let prefix = app.get_tree_prefix(index);
             let indicator = node.expansion_indicator();
+            let dep_color = get_dep_type_color(node.dep_type);
+            let type_indicator = get_dep_type_indicator(node.dep_type);
 
             let content = Line::from(vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(indicator, Style::default().fg(Color::Yellow)),
-                Span::styled(&node.name, Style::default().fg(Color::White)),
+                Span::styled(type_indicator, Style::default().fg(dep_color)),
+                Span::styled(&node.name, Style::default().fg(dep_color)),
                 Span::styled(
                     format!(" @{}", node.version),
                     Style::default().fg(Color::DarkGray),
@@ -250,7 +288,7 @@ pub fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(tree_list, area, &mut app.list_state);
 }
 
-/// Render the footer with help text
+/// Render the footer with help text and legend
 fn render_footer(frame: &mut Frame, area: Rect) {
     let help_text = Line::from(vec![
         Span::styled("j/↓", Style::default().fg(Color::Yellow)),
@@ -260,7 +298,15 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::styled("Enter/Space", Style::default().fg(Color::Yellow)),
         Span::raw(" Toggle  "),
         Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" Quit"),
+        Span::raw(" Quit  │  "),
+        Span::styled("[P]", Style::default().fg(Color::Green)),
+        Span::raw(" Prod  "),
+        Span::styled("[D]", Style::default().fg(Color::Yellow)),
+        Span::raw(" Dev  "),
+        Span::styled("[Pe]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Peer  "),
+        Span::styled("[O]", Style::default().fg(Color::Gray)),
+        Span::raw(" Optional"),
     ]);
 
     let footer = Paragraph::new(help_text)

@@ -3,6 +3,8 @@
 //! Provides `TreeNode` for hierarchical data and `FlattenedNode`
 //! for rendering the tree as a scrollable list in the TUI.
 
+use crate::parser::types::DependencyType;
+
 /// A node in the dependency tree
 #[derive(Debug, Clone)]
 pub struct TreeNode {
@@ -16,6 +18,8 @@ pub struct TreeNode {
     pub expanded: bool,
     /// Depth in the tree (0 = root)
     pub depth: usize,
+    /// The type of dependency (Production, Development, Peer, Optional)
+    pub dep_type: Option<DependencyType>,
 }
 
 impl TreeNode {
@@ -27,10 +31,12 @@ impl TreeNode {
             children: Vec::new(),
             expanded: false,
             depth: 0,
+            dep_type: None,
         }
     }
 
     /// Create a new tree node with specified depth
+    #[cfg(test)]
     pub fn with_depth(name: String, version: String, depth: usize) -> Self {
         Self {
             name,
@@ -38,6 +44,19 @@ impl TreeNode {
             children: Vec::new(),
             expanded: false,
             depth,
+            dep_type: None,
+        }
+    }
+
+    /// Create a new tree node with dependency type
+    pub fn with_dep_type(name: String, version: String, dep_type: DependencyType) -> Self {
+        Self {
+            name,
+            version,
+            children: Vec::new(),
+            expanded: false,
+            depth: 0,
+            dep_type: Some(dep_type),
         }
     }
 
@@ -76,6 +95,7 @@ impl TreeNode {
             is_expanded: self.expanded,
             has_children: self.has_children(),
             is_last_child: is_last,
+            dep_type: self.dep_type,
         });
 
         if self.expanded {
@@ -132,6 +152,8 @@ pub struct FlattenedNode {
     pub has_children: bool,
     /// Whether this is the last child of its parent
     pub is_last_child: bool,
+    /// The type of dependency (Production, Development, Peer, Optional)
+    pub dep_type: Option<DependencyType>,
 }
 
 impl FlattenedNode {
@@ -147,6 +169,7 @@ impl FlattenedNode {
     }
 
     /// Build the tree prefix (indentation and branch lines)
+    #[allow(dead_code)]
     pub fn tree_prefix(&self, ancestors_are_last: &[bool]) -> String {
         let mut prefix = String::new();
 
@@ -269,6 +292,7 @@ mod tests {
             is_expanded: false,
             has_children: true,
             is_last_child: false,
+            dep_type: None,
         };
         assert_eq!(node_with_children.expansion_indicator(), "▶ ");
 
@@ -283,5 +307,16 @@ mod tests {
             ..node_with_children
         };
         assert_eq!(leaf_node.expansion_indicator(), "  ");
+    }
+
+    #[test]
+    fn test_tree_node_with_dep_type() {
+        let node = TreeNode::with_dep_type(
+            "react".to_string(),
+            "18.0.0".to_string(),
+            DependencyType::Production,
+        );
+        assert_eq!(node.name, "react");
+        assert_eq!(node.dep_type, Some(DependencyType::Production));
     }
 }
